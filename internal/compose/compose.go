@@ -21,14 +21,31 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ComposeFile represents a Compose project file on disk.
 type ComposeFile struct {
 	Filepath string
 }
 
+// NewComposeFile creates a ComposeFile for the given absolute path.
 func NewComposeFile(filepath string) *ComposeFile {
 	return &ComposeFile{
 		Filepath: filepath,
 	}
+}
+
+// FindComposeFile returns the preferred Compose file path inside dir.
+// "compose.yaml" takes precedence over "docker-compose.yml".
+// Returns an error when neither file exists.
+func FindComposeFile(dir string) (string, error) {
+	preferred := filepath.Join(dir, "compose.yaml")
+	if _, err := os.Stat(preferred); err == nil {
+		return preferred, nil
+	}
+	fallback := filepath.Join(dir, "docker-compose.yml")
+	if _, err := os.Stat(fallback); err == nil {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("no compose file found in %s (tried compose.yaml and docker-compose.yml)", dir)
 }
 
 func (c ComposeFile) LoadProject() (*types.Project, error) {
