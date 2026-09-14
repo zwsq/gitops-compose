@@ -142,7 +142,7 @@ func TestHasChanges_WithNewCommit(t *testing.T) {
 
 	// A second clone pushes a change
 	second := makeSecondClone(t, bareDir, "main")
-	pushCommit(t, second, "beta/payments/.env", "PAYMENTS_IMAGE=repo.asax.ir/ats/payments:1.42.8", "main")
+	pushCommit(t, second, "beta/payments/.env", "PAYMENTS_IMAGE=registry.example.com/payments:1.42.8", "main")
 
 	// Our repo should detect the remote is ahead
 	has, err := repo.HasChanges()
@@ -162,7 +162,7 @@ func TestChangedDeploymentDirs_EnvChange(t *testing.T) {
 	bareDir, cloneDir, repo := initBareAndClone(t, "main")
 	second := makeSecondClone(t, bareDir, "main")
 
-	pushCommit(t, second, "beta/payments/.env", "PAYMENTS_IMAGE=repo.asax.ir/ats/payments:1.42.8", "main")
+	pushCommit(t, second, "beta/payments/.env", "PAYMENTS_IMAGE=registry.example.com/payments:1.42.8", "main")
 
 	// Fetch so remote ref advances
 	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
@@ -223,7 +223,7 @@ func TestChangedDeploymentDirs_FrontendDoesNotAffectPayments(t *testing.T) {
 	second := makeSecondClone(t, bareDir, "main")
 
 	// Only beta/frontend changes
-	pushCommit(t, second, "beta/frontend/.env", "FRONTEND_IMAGE=repo.asax.ir/ats/frontend:2.0.0", "main")
+	pushCommit(t, second, "beta/frontend/.env", "FRONTEND_IMAGE=registry.example.com/frontend:2.0.0", "main")
 	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
 
 	dirs, err := repo.ChangedDeploymentDirs()

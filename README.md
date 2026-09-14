@@ -74,8 +74,8 @@ The CD pipeline builds and pushes a Docker image, then commits an image-tag
 update to the appropriate `.env`:
 
 ```diff
--PAYMENTS_IMAGE=repo.asax.ir/ats/payments:1.42.7
-+PAYMENTS_IMAGE=repo.asax.ir/ats/payments:1.42.8
+-PAYMENTS_IMAGE=registry.example.com/payments:1.42.7
++PAYMENTS_IMAGE=registry.example.com/payments:1.42.8
 ```
 
 GitopsCompose detects the changed file (`beta/payments/.env`), maps it to the
@@ -173,7 +173,7 @@ chmod 600 /opt/gitops-compose/ssh/id_ed25519
 # /opt/gitops-compose/docker-compose.yml
 services:
   gitops-compose:
-    image: ghcr.io/korbiniankuhn/gitops-compose:latest
+    image: ghcr.io/zwsq/gitops-compose:latest
     container_name: gitops-compose
     restart: unless-stopped
     ports:
@@ -187,7 +187,7 @@ services:
       SSH_KEY_PATH: /ssh/id_ed25519
       SSH_KNOWN_HOSTS_PATH: /ssh/known_hosts
       CHECK_INTERVAL_IN_SECONDS: 30
-      DOCKER_REGISTRIES: '[{"url":"repo.asax.ir","username":"robot","password":"secret"}]'
+      DOCKER_REGISTRIES: '[{"url":"registry.example.com","username":"robot","password":"secret"}]'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/deployments:/deployments
@@ -323,9 +323,9 @@ A prebuilt Grafana dashboard is available at [dashboard.json](dashboard.json).
 Images are published to the GitHub Container Registry:
 
 ```text
-ghcr.io/korbiniankuhn/gitops-compose:latest      ← latest main build
-ghcr.io/korbiniankuhn/gitops-compose:v1.2.3      ← specific release
-ghcr.io/korbiniankuhn/gitops-compose:sha-abc1234  ← immutable SHA tag
+ghcr.io/zwsq/gitops-compose:latest      ← latest main build
+ghcr.io/zwsq/gitops-compose:v1.2.3      ← specific release
+ghcr.io/zwsq/gitops-compose:sha-abc1234  ← immutable SHA tag
 ```
 
 Multi-architecture manifest covers `linux/amd64` and `linux/arm64`.
