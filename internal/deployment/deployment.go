@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"sort"
 
 	"github.com/korbiniankuhn/gitops-compose/internal/compose"
@@ -56,6 +57,12 @@ func NewDeployment(docker *docker.Docker, filepath string) *Deployment {
 		config:   DeploymentConfig{},
 		Error:    nil,
 	}
+}
+
+// Dir returns the directory containing the compose file (i.e. the deployment
+// directory).
+func (d *Deployment) Dir() string {
+	return path.Dir(d.Filepath)
 }
 
 func (d *Deployment) LoadConfig() error {

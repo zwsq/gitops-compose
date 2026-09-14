@@ -49,15 +49,22 @@ func main() {
 		slog.SetLogLoggerLevel(slog.Level(c.LogLevel))
 	}
 
-	if c.RepositoryUsername == "" {
+	// Build git repo options based on the configured auth method
+	deploymentRepoOptions := []git.DeploymentRepoOption{
+		git.WithBranch(c.RepositoryBranch),
+	}
+
+	if c.SSHEnabled() {
+		slog.Info("SSH auth configured", "key", c.SSHKeyPath)
+		deploymentRepoOptions = append(deploymentRepoOptions,
+			git.WithSSH(c.SSHKeyPath, c.SSHKnownHostsPath))
+	} else if c.RepositoryUsername != "" {
+		deploymentRepoOptions = append(deploymentRepoOptions,
+			git.WithAuth(c.RepositoryUsername, c.RepositoryPassword))
+	} else {
 		slog.Warn("no credentials set in repository origin")
 	}
 
-	// Verify git repository
-	deploymentRepoOptions := []git.DeploymentRepoOption{}
-	if c.RepositoryUsername != "" {
-		deploymentRepoOptions = append(deploymentRepoOptions, git.WithAuth(c.RepositoryUsername, c.RepositoryPassword))
-	}
 	r, err := git.NewDeploymentRepo(c.RepositoryPath, deploymentRepoOptions...)
 	panicOnError("failed to create deployment repo", err)
 	slog.Info("deployment repo initialised", "path", c.RepositoryPath)
@@ -115,7 +122,8 @@ func main() {
 
 	// Run gitops check on interval
 	if c.CheckIntervalInSeconds > 0 {
-		slog.Info(fmt.Sprintf("starting gitops repeated pull (every %s seconds)", fmt.Sprint(c.CheckIntervalInSeconds)))
+		slog.Info("starting gitops repeated pull",
+			"interval", fmt.Sprintf("%ds", c.CheckIntervalInSeconds))
 		go func() {
 			ticker := time.NewTicker(time.Duration(c.CheckIntervalInSeconds) * time.Second)
 			defer ticker.Stop()

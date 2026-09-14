@@ -1,3 +1,9 @@
+// Package git wraps go-git and the git CLI for the gitops-compose deployment
+// repository.  It supports:
+//   - HTTP basic-auth (original behaviour)
+//   - SSH key auth via GIT_SSH_COMMAND (Azure DevOps and similar)
+//   - Configurable tracking branch (default: main)
+//   - Changed-path detection between two commits
 package git
 
 import (
@@ -5,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 
 	gogit "github.com/go-git/go-git/v5"
@@ -18,13 +25,25 @@ var (
 	ErrHasLocalChanges  = fmt.Errorf("local changes detected")
 )
 
+// DeploymentRepo represents a local clone of the GitOps deployment repository.
 type DeploymentRepo struct {
+	// HTTP basic-auth (nil when SSH is used)
 	auth *gitHttp.BasicAuth
+
+	// SSH configuration (empty values mean SSH is disabled)
+	sshKeyPath        string
+	sshKnownHostsPath string
+
+	// Local clone path
 	path string
+
+	// Branch being tracked (e.g. "main", "beta")
+	branch string
 }
 
 type DeploymentRepoOption func(*DeploymentRepo)
 
+// WithAuth configures HTTP basic-auth credentials.
 func WithAuth(username, password string) DeploymentRepoOption {
 	return func(r *DeploymentRepo) {
 		r.auth = &gitHttp.BasicAuth{
@@ -34,33 +53,41 @@ func WithAuth(username, password string) DeploymentRepoOption {
 	}
 }
 
-func NewDeploymentRepo(path string, opts ...DeploymentRepoOption) (*DeploymentRepo, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+// WithSSH configures SSH key-based authentication.
+// keyPath is the path to the private key file (e.g. /ssh/id_ed25519).
+// knownHostsPath is the path to a known_hosts file; if empty the system default
+// (~/.ssh/known_hosts) is used.
+// Host key verification is always enabled — StrictHostKeyChecking=no is
+// intentionally NOT set.
+func WithSSH(keyPath, knownHostsPath string) DeploymentRepoOption {
+	return func(r *DeploymentRepo) {
+		r.sshKeyPath = keyPath
+		r.sshKnownHostsPath = knownHostsPath
+	}
+}
+
+// WithBranch sets the Git branch that the repo should track.
+func WithBranch(branch string) DeploymentRepoOption {
+	return func(r *DeploymentRepo) {
+		if branch != "" {
+			r.branch = branch
+		}
+	}
+}
+
+// NewDeploymentRepo opens the repository at path and applies options.
+func NewDeploymentRepo(repoPath string, opts ...DeploymentRepoOption) (*DeploymentRepo, error) {
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
 		return nil, ErrPathDoesNotExist
 	}
 
-	r, err := gogit.PlainOpen(path)
-	if err != nil {
+	if _, err := gogit.PlainOpen(repoPath); err != nil {
 		return nil, fmt.Errorf("open repo failed: %w", err)
 	}
 
-	origin, err := r.Remote("origin")
-	if err != nil {
-		return nil, fmt.Errorf("get remote failed: %w", err)
-	}
-
-	var remoteURL string
-	for _, u := range origin.Config().URLs {
-		remoteURL = u
-		break
-	}
-
-	if remoteURL == "" {
-		return nil, fmt.Errorf("remote url not found")
-	}
-
 	repo := &DeploymentRepo{
-		path: path,
+		path:   repoPath,
+		branch: "main",
 	}
 
 	for _, opt := range opts {
@@ -70,7 +97,61 @@ func NewDeploymentRepo(path string, opts ...DeploymentRepoOption) (*DeploymentRe
 	return repo, nil
 }
 
-func (r DeploymentRepo) VerifyRemoteAccess() error {
+// sshEnabled returns true when SSH key auth is configured.
+func (r *DeploymentRepo) sshEnabled() bool {
+	return r.sshKeyPath != ""
+}
+
+// gitSSHCommand builds the value for the GIT_SSH_COMMAND environment variable.
+// It enforces known-hosts verification and never disables StrictHostKeyChecking.
+// The private key path is passed to the ssh binary but is not logged.
+func (r *DeploymentRepo) gitSSHCommand() string {
+	// Base command — never log the key path in error messages; keep it in env only.
+	parts := []string{
+		"ssh",
+		"-i", r.sshKeyPath,
+		"-o", "IdentitiesOnly=yes",
+	}
+	if r.sshKnownHostsPath != "" {
+		parts = append(parts, "-o", "UserKnownHostsFile="+r.sshKnownHostsPath)
+	}
+	return strings.Join(parts, " ")
+}
+
+// cmdWithSSH decorates cmd with GIT_SSH_COMMAND when SSH is configured.
+// The private key value is placed in the process environment, not in any log.
+func (r *DeploymentRepo) cmdWithSSH(cmd *exec.Cmd) *exec.Cmd {
+	if !r.sshEnabled() {
+		return cmd
+	}
+	cmd.Env = append(os.Environ(), "GIT_SSH_COMMAND="+r.gitSSHCommand())
+	return cmd
+}
+
+// localRef returns the refname for the local tracking branch.
+func (r *DeploymentRepo) localRef() plumbing.ReferenceName {
+	return plumbing.ReferenceName("refs/heads/" + r.branch)
+}
+
+// remoteRef returns the refname for the remote tracking branch.
+func (r *DeploymentRepo) remoteRef() plumbing.ReferenceName {
+	return plumbing.ReferenceName("refs/remotes/origin/" + r.branch)
+}
+
+// VerifyRemoteAccess checks that the remote is reachable.
+// For SSH repos it uses the git CLI so GIT_SSH_COMMAND is honoured.
+func (r *DeploymentRepo) VerifyRemoteAccess() error {
+	if r.sshEnabled() {
+		cmd := exec.Command("git", "ls-remote", "--heads", "origin")
+		cmd.Dir = r.path
+		r.cmdWithSSH(cmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("remote is not working or SSH auth failed: %w", sanitiseOutput(out))
+		}
+		return nil
+	}
+
 	repo, err := gogit.PlainOpen(r.path)
 	if err != nil {
 		return fmt.Errorf("open repo failed: %w", err)
@@ -86,87 +167,215 @@ func (r DeploymentRepo) VerifyRemoteAccess() error {
 		listOptions.Auth = r.auth
 	}
 
-	_, err = remote.List(listOptions)
-	if err != nil {
+	if _, err = remote.List(listOptions); err != nil {
 		return fmt.Errorf("remote is not working or auth failed: %w", err)
 	}
 
 	return nil
 }
 
-func (r DeploymentRepo) HasChanges() (bool, error) {
-	// Open the repository
+// VerifyGitCli confirms that the git CLI is available.
+func (r *DeploymentRepo) VerifyGitCli() error {
+	cmd := exec.Command("git", "ls-remote", "--heads", "origin")
+	cmd.Dir = r.path
+	r.cmdWithSSH(cmd)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git cli remote access failed: %w %s", err, sanitiseOutput(out))
+	}
+	return nil
+}
+
+// sanitiseOutput converts command output to an error, stripping trailing
+// whitespace.  It does NOT include SSH key material.
+func sanitiseOutput(out []byte) error {
+	msg := strings.TrimSpace(string(out))
+	if msg == "" {
+		return fmt.Errorf("(no output)")
+	}
+	return fmt.Errorf("%s", msg)
+}
+
+// HasChanges fetches the remote and reports whether the remote tracking branch
+// is ahead of the local branch.
+func (r *DeploymentRepo) HasChanges() (bool, error) {
 	repo, err := gogit.PlainOpen(r.path)
 	if err != nil {
 		return false, fmt.Errorf("open repo failed: %w", err)
 	}
 
-	// Get the working tree
 	worktree, err := repo.Worktree()
 	if err != nil {
 		return false, fmt.Errorf("get worktree failed: %w", err)
 	}
 
-	// Check if the working tree is clean
 	status, err := worktree.Status()
 	if err != nil {
 		return false, fmt.Errorf("get status failed: %w", err)
 	}
 
-	// If there are changes, we cannot savely proceed
 	if !status.IsClean() {
 		return false, ErrHasLocalChanges
 	}
 
-	// Fetch the latest changes from the remote repository
-	err = repo.Fetch(&gogit.FetchOptions{
-		RemoteName: "origin",
-		Auth:       r.auth,
-		Tags:       gogit.NoTags,
-		Force:      false,
-		Prune:      false,
-	})
-	if err != nil {
-		if err == gogit.NoErrAlreadyUpToDate {
-			return false, nil
+	// Use git CLI fetch when SSH is configured so GIT_SSH_COMMAND is used.
+	if r.sshEnabled() {
+		cmd := exec.Command("git", "fetch", "origin", r.branch)
+		cmd.Dir = r.path
+		r.cmdWithSSH(cmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return false, fmt.Errorf("fetch failed: %w %s", err, sanitiseOutput(out))
 		}
-		return false, fmt.Errorf("fetch failed: %w", err)
+	} else {
+		fetchOpts := &gogit.FetchOptions{
+			RemoteName: "origin",
+			Auth:       r.auth,
+			Tags:       gogit.NoTags,
+			Force:      false,
+			Prune:      false,
+		}
+		if err := repo.Fetch(fetchOpts); err != nil {
+			if err == gogit.NoErrAlreadyUpToDate {
+				return false, nil
+			}
+			return false, fmt.Errorf("fetch failed: %w", err)
+		}
 	}
 
-	// Get the local references for the main branch
-	localRef, err := repo.Reference(plumbing.ReferenceName("refs/heads/main"), true)
+	localRef, err := repo.Reference(r.localRef(), true)
 	if err != nil {
 		return false, fmt.Errorf("get local ref failed: %w", err)
 	}
 
-	// Get the remote references for the main branch
-	remoteRef, err := repo.Reference(plumbing.ReferenceName("refs/remotes/origin/main"), true)
+	remoteRef, err := repo.Reference(r.remoteRef(), true)
 	if err != nil {
 		return false, fmt.Errorf("get remote ref failed: %w", err)
 	}
 
-	// Compare the hashes of the local and remote references
-	if localRef.Hash() == remoteRef.Hash() {
-		return false, nil
-	} else {
-		return true, nil
-	}
+	return localRef.Hash() != remoteRef.Hash(), nil
 }
 
-func (r DeploymentRepo) filterComposeFiles(c object.Commit) ([]string, error) {
-	// Get the tree of the commit
+// ChangedDeploymentDirs returns the set of top-level deployment directories
+// (relative to the repository root) that contain at least one file changed
+// between the current local HEAD and the remote HEAD.
+//
+// A "deployment directory" is the immediate parent of any changed file, but
+// only up to the depth configured by the caller — here we return the
+// top-two-level path segment (e.g. "beta/payments") so that a change to
+// "beta/payments/.env" maps to "beta/payments", not "beta".
+//
+// If the two commits are identical, the returned slice is empty.
+func (r *DeploymentRepo) ChangedDeploymentDirs() ([]string, error) {
+	repo, err := gogit.PlainOpen(r.path)
+	if err != nil {
+		return nil, fmt.Errorf("open repo failed: %w", err)
+	}
+
+	localRef, err := repo.Reference(r.localRef(), true)
+	if err != nil {
+		return nil, fmt.Errorf("get local ref failed: %w", err)
+	}
+
+	remoteRef, err := repo.Reference(r.remoteRef(), true)
+	if err != nil {
+		return nil, fmt.Errorf("get remote ref failed: %w", err)
+	}
+
+	if localRef.Hash() == remoteRef.Hash() {
+		return []string{}, nil
+	}
+
+	localCommit, err := repo.CommitObject(localRef.Hash())
+	if err != nil {
+		return nil, fmt.Errorf("get local commit failed: %w", err)
+	}
+
+	remoteCommit, err := repo.CommitObject(remoteRef.Hash())
+	if err != nil {
+		return nil, fmt.Errorf("get remote commit failed: %w", err)
+	}
+
+	patch, err := localCommit.Patch(remoteCommit)
+	if err != nil {
+		return nil, fmt.Errorf("compute patch failed: %w", err)
+	}
+
+	seen := map[string]struct{}{}
+	for _, fp := range patch.FilePatches() {
+		from, to := fp.Files()
+		for _, f := range []object.File{safeFile(from), safeFile(to)} {
+			if f == (object.File{}) {
+				continue
+			}
+			dir := deploymentDirFromPath(f.Name)
+			if dir != "" {
+				seen[dir] = struct{}{}
+			}
+		}
+	}
+
+	dirs := make([]string, 0, len(seen))
+	for d := range seen {
+		dirs = append(dirs, d)
+	}
+	return dirs, nil
+}
+
+// safeFile converts a nullable diff.File interface to an object.File value.
+// Returns the zero value when the interface is nil.
+func safeFile(f interface {
+	Hash() plumbing.Hash
+	Path() string
+}) object.File {
+	if f == nil {
+		return object.File{}
+	}
+	return object.File{Name: f.Path()}
+}
+
+// deploymentDirFromPath extracts the deployment directory from a file path.
+// For a path like "beta/payments/.env" it returns "beta/payments".
+// For a path like "payments/.env" it returns "payments".
+// Files at the repository root (no directory component) return "".
+func deploymentDirFromPath(filePath string) string {
+	dir := path.Dir(filePath)
+	if dir == "." || dir == "" {
+		return ""
+	}
+	return dir
+}
+
+// filterComposeFiles returns the full filesystem paths of all compose files in
+// the commit tree rooted at the given commit.  Both "compose.yaml" and
+// "docker-compose.yml" are recognised; when both exist in the same directory,
+// only "compose.yaml" is returned (preferred).
+func (r *DeploymentRepo) filterComposeFiles(c object.Commit) ([]string, error) {
 	tree, err := c.Tree()
 	if err != nil {
 		return nil, fmt.Errorf("get tree failed: %w", err)
 	}
 
-	// Iterate through the files in the tree
-	var composeFiles []string
+	// dir → preferred file (compose.yaml wins over docker-compose.yml)
+	dirToFile := map[string]string{}
+
 	err = tree.Files().ForEach(func(f *object.File) error {
-		filename := path.Base(f.Name)
-		if filename == "docker-compose.yml" {
-			filepath := path.Join(r.path, f.Name)
-			composeFiles = append(composeFiles, filepath)
+		base := path.Base(f.Name)
+		dir := path.Dir(f.Name)
+		if dir == "." {
+			dir = ""
+		}
+
+		switch base {
+		case "compose.yaml":
+			// Always prefer compose.yaml
+			dirToFile[dir] = filepath.Join(r.path, f.Name)
+		case "docker-compose.yml":
+			// Only use docker-compose.yml if compose.yaml not already found
+			if _, exists := dirToFile[dir]; !exists {
+				dirToFile[dir] = filepath.Join(r.path, f.Name)
+			}
 		}
 		return nil
 	})
@@ -174,23 +383,25 @@ func (r DeploymentRepo) filterComposeFiles(c object.Commit) ([]string, error) {
 		return nil, fmt.Errorf("walk tree failed: %w", err)
 	}
 
-	return composeFiles, nil
+	files := make([]string, 0, len(dirToFile))
+	for _, fpath := range dirToFile {
+		files = append(files, fpath)
+	}
+	return files, nil
 }
 
-func (r DeploymentRepo) GetRemoteComposeFiles() ([]string, error) {
-	// Open the repository
+// GetRemoteComposeFiles returns compose file paths from the remote HEAD.
+func (r *DeploymentRepo) GetRemoteComposeFiles() ([]string, error) {
 	repo, err := gogit.PlainOpen(r.path)
 	if err != nil {
 		return nil, fmt.Errorf("open repo failed: %w", err)
 	}
 
-	// Get the remote references for the main branch
-	ref, err := repo.Reference(plumbing.ReferenceName("refs/remotes/origin/main"), true)
+	ref, err := repo.Reference(r.remoteRef(), true)
 	if err != nil {
 		return nil, fmt.Errorf("get remote ref failed: %w", err)
 	}
 
-	// Get the latest commit from the remote main branch
 	commit, err := repo.CommitObject(ref.Hash())
 	if err != nil {
 		return nil, fmt.Errorf("get commit object failed: %w", err)
@@ -199,20 +410,18 @@ func (r DeploymentRepo) GetRemoteComposeFiles() ([]string, error) {
 	return r.filterComposeFiles(*commit)
 }
 
-func (r DeploymentRepo) GetLocalComposeFiles() ([]string, error) {
-	// Open the repository
+// GetLocalComposeFiles returns compose file paths from the local HEAD.
+func (r *DeploymentRepo) GetLocalComposeFiles() ([]string, error) {
 	repo, err := gogit.PlainOpen(r.path)
 	if err != nil {
 		return nil, fmt.Errorf("open repo failed: %w", err)
 	}
 
-	// Get the local references for the main branch
-	ref, err := repo.Reference(plumbing.ReferenceName("refs/heads/main"), true)
+	ref, err := repo.Reference(r.localRef(), true)
 	if err != nil {
 		return nil, fmt.Errorf("get local ref failed: %w", err)
 	}
 
-	// Get the latest commit from the local main branch
 	commit, err := repo.CommitObject(ref.Hash())
 	if err != nil {
 		return nil, fmt.Errorf("get commit object failed: %w", err)
@@ -221,21 +430,12 @@ func (r DeploymentRepo) GetLocalComposeFiles() ([]string, error) {
 	return r.filterComposeFiles(*commit)
 }
 
-func (r DeploymentRepo) VerifyGitCli() error {
-	cmd := exec.Command("git", "ls-remote")
+// Pull fast-forwards the local branch to the remote HEAD.
+// TODO: Replace exec with go-git once https://github.com/go-git/go-git/pull/1235 is resolved.
+func (r *DeploymentRepo) Pull() error {
+	cmd := exec.Command("git", "pull", "origin", r.branch)
 	cmd.Dir = r.path
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git cli remote access failed: %w %s", err, out)
-	}
-	return nil
-}
-
-// TODO: Use go-git instead of exec when this issue is resolved (https://github.com/go-git/go-git/pull/1235)
-func (r DeploymentRepo) Pull() error {
-	cmd := exec.Command("git", "pull")
-	cmd.Dir = r.path
+	r.cmdWithSSH(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -243,7 +443,7 @@ func (r DeploymentRepo) Pull() error {
 		if outStr == "Already up to date." || outStr == "Already up-to-date." {
 			return nil
 		}
-		return fmt.Errorf("pull failed: %w %s", err, output)
+		return fmt.Errorf("pull failed: %w %s", err, outStr)
 	}
 
 	return nil
