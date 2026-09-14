@@ -1,8 +1,12 @@
+// Package gitops is the main reconciliation loop: it compares local and remote
+// Git state, identifies which deployments changed, and runs docker-compose up.
 package gitops
 
 import (
 	"log/slog"
+	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/korbiniankuhn/gitops-compose/internal/deployment"
 	"github.com/korbiniankuhn/gitops-compose/internal/docker"
@@ -65,7 +69,6 @@ func (g *GitOps) applyDeploymentChange(d *deployment.Deployment, state *metrics.
 			state.Started++
 			slog.Info("started new deployment", "file", d.Filepath)
 		} else {
-			// Should never happen
 			state.Unchanged++
 			slog.Warn("new deployment was already running", "file", d.Filepath)
 		}
@@ -74,7 +77,6 @@ func (g *GitOps) applyDeploymentChange(d *deployment.Deployment, state *metrics.
 			state.Updated++
 			slog.Info("updated deployment", "file", d.Filepath)
 		} else {
-			// Should never happen
 			state.Unchanged++
 			slog.Warn("updated deployment was already running", "file", d.Filepath)
 		}
@@ -96,8 +98,41 @@ func (g *GitOps) applyDeploymentChange(d *deployment.Deployment, state *metrics.
 	}
 }
 
-func (g *GitOps) checkAndUpdateDeployments(state *metrics.DeploymentState) ([]*deployment.Deployment, error) {
-	// Get local and remote compose files
+// matchesChangedDirs returns true when the deployment's directory path ends
+// with (or equals) one of the changed directory segments.
+//
+// changedDirs contains relative paths from the repository root such as
+// "beta/payments".  d.Dir() is an absolute filesystem path such as
+// "/deployments/beta/payments".  We check suffix-match so the mapping works
+// regardless of the clone mount point.
+func matchesChangedDirs(d *deployment.Deployment, changedDirs []string) bool {
+	if len(changedDirs) == 0 {
+		return false
+	}
+	deployDir := filepath.ToSlash(d.Dir())
+	for _, changed := range changedDirs {
+		changed = filepath.ToSlash(changed)
+		// Exact suffix or path suffix (with separator boundary)
+		if deployDir == changed ||
+			strings.HasSuffix(deployDir, "/"+changed) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkAndUpdateDeployments reconciles local compose deployments against the
+// remote Git state.
+//
+// When changedDirs is non-empty (incremental update), only deployments whose
+// directory appears in changedDirs are reconciled; all others are left alone.
+// When changedDirs is empty (first-run / forced full reconcile), all
+// deployments are reconciled.
+func (g *GitOps) checkAndUpdateDeployments(
+	state *metrics.DeploymentState,
+	changedDirs []string,
+) ([]*deployment.Deployment, error) {
+
 	localComposeFiles, err := g.repo.GetLocalComposeFiles()
 	if err != nil {
 		slog.Error("error getting local compose files", "err", err)
@@ -110,13 +145,12 @@ func (g *GitOps) checkAndUpdateDeployments(state *metrics.DeploymentState) ([]*d
 		return []*deployment.Deployment{}, err
 	}
 
-	// Determine which deployments to add, remove, or update
+	// Build the full deployment list
 	deployments := []*deployment.Deployment{}
 	for _, localFile := range localComposeFiles {
 		d := deployment.NewDeployment(g.docker, localFile)
 
-		err := d.LoadConfig()
-		if err != nil {
+		if err := d.LoadConfig(); err != nil {
 			slog.Error("error loading deployment config", "file", d.Filepath, "err", err)
 		}
 
@@ -134,47 +168,58 @@ func (g *GitOps) checkAndUpdateDeployments(state *metrics.DeploymentState) ([]*d
 	}
 
 	// Ensure docker login if credentials are set
-	_, err = g.docker.LoginIfCredentialsSet()
-	if err != nil {
+	if _, err = g.docker.LoginIfCredentialsSet(); err != nil {
 		slog.Error("error logging in to docker registry", "err", err)
 		return []*deployment.Deployment{}, err
 	}
 
-	// Stop removed deployments
+	// Stop removed deployments first.
+	// When changedDirs is provided, only stop deployments in those dirs.
 	for _, d := range deployments {
 		if d.IsIgnored() || d.IsController() {
 			continue
 		}
-		if d.State == deployment.Removed {
-			g.applyDeploymentChange(d, state)
-		}
-	}
-
-	// Pull Git changes
-	if err := g.repo.Pull(); err != nil {
-		slog.Error("error pulling changes", "err", err)
-		return deployments, err
-	}
-
-	// Update deployment states (check if compose files are valid and if they changed)
-	for _, d := range deployments {
 		if d.State != deployment.Removed {
-			err := d.LoadConfig()
-			if err != nil {
-				slog.Error("error loading deployment config", "file", d.Filepath, "err", err)
-			}
+			continue
 		}
-	}
-
-	// Update deployments (add, changed, unchanged)
-	for _, d := range deployments {
-		if d.IsIgnored() || d.IsController() || d.State == deployment.Removed {
+		if len(changedDirs) > 0 && !matchesChangedDirs(d, changedDirs) {
 			continue
 		}
 		g.applyDeploymentChange(d, state)
 	}
 
-	// Post deployment operations
+	// Pull Git changes.
+	// IMPORTANT: Pull happens AFTER we record the list of changed dirs but
+	// BEFORE we apply the new compose files — this is identical to the
+	// original behaviour.
+	if err := g.repo.Pull(); err != nil {
+		slog.Error("error pulling changes", "err", err)
+		return deployments, err
+	}
+
+	// Reload config for non-removed deployments (picks up new image tags etc.)
+	for _, d := range deployments {
+		if d.State != deployment.Removed {
+			if err := d.LoadConfig(); err != nil {
+				slog.Error("error loading deployment config", "file", d.Filepath, "err", err)
+			}
+		}
+	}
+
+	// Apply add/update/unchanged deployments.
+	for _, d := range deployments {
+		if d.IsIgnored() || d.IsController() || d.State == deployment.Removed {
+			continue
+		}
+		// In incremental mode, skip deployments that are not in the changed set.
+		if len(changedDirs) > 0 && !matchesChangedDirs(d, changedDirs) {
+			state.Unchanged++
+			continue
+		}
+		g.applyDeploymentChange(d, state)
+	}
+
+	// Post-deployment bookkeeping
 	for _, d := range deployments {
 		if d.IsIgnored() {
 			if d.State != deployment.Removed {
@@ -186,20 +231,13 @@ func (g *GitOps) checkAndUpdateDeployments(state *metrics.DeploymentState) ([]*d
 		if d.IsController() {
 			switch d.State {
 			case deployment.Removed:
-				{
-					slog.Error("cannot remove controller deployment", "file", d.Filepath)
-					state.Failed++
-				}
+				slog.Error("cannot remove controller deployment", "file", d.Filepath)
+				state.Failed++
 			case deployment.Added:
-				{
-					slog.Error("cannot add controller deployment", "file", d.Filepath)
-					state.Failed++
-				}
+				slog.Error("cannot add controller deployment", "file", d.Filepath)
+				state.Failed++
 			case deployment.Updated:
-				{
-					slog.Error("update controller deployment is not implemented yet", "file", d.Filepath)
-					// TODO: skip for docker desktop or non-docker use
-				}
+				slog.Error("update controller deployment is not implemented yet", "file", d.Filepath)
 			}
 		}
 	}
@@ -209,31 +247,27 @@ func (g *GitOps) checkAndUpdateDeployments(state *metrics.DeploymentState) ([]*d
 
 func (g *GitOps) CheckAndUpdate() {
 	if g.isFirstCheck {
-		defer func() {
-			g.isFirstCheck = false
-		}()
+		defer func() { g.isFirstCheck = false }()
 	}
 
 	hasChanges, err := g.repo.HasChanges()
-
 	if err != nil {
 		g.metrics.TrackCheckStatus("error")
 		slog.Error("error checking for git changes", "err", err)
 		return
+	}
+
+	g.metrics.TrackCheckStatus("success")
+	if hasChanges {
+		slog.Info("git changes detected")
+	} else if g.isFirstCheck {
+		slog.Info("first run, ensuring all deployments are running")
 	} else {
-		g.metrics.TrackCheckStatus("success")
-		if hasChanges {
-			slog.Info("git changes detected")
-		} else if g.isFirstCheck {
-			slog.Info("first run, ensure all deployments are running")
-		} else {
-			slog.Info("no git changes detected")
-		}
+		slog.Info("no git changes detected")
 	}
 
 	newRetryDeployments := []*deployment.Deployment{}
 	defer func() {
-		// Save deployments that need to be retried
 		g.retryDeployments = newRetryDeployments
 		for _, d := range g.retryDeployments {
 			slog.Info("scheduling deployment for retry due to image pull backoff", "file", d.Filepath)
@@ -241,8 +275,23 @@ func (g *GitOps) CheckAndUpdate() {
 	}()
 
 	if hasChanges || g.isFirstCheck {
+		// Determine which deployment directories actually changed.
+		// On first run we pass an empty slice so that all deployments are
+		// reconciled (full reconcile).
+		var changedDirs []string
+		if hasChanges && !g.isFirstCheck {
+			changedDirs, err = g.repo.ChangedDeploymentDirs()
+			if err != nil {
+				slog.Error("error computing changed deployment dirs", "err", err)
+				// Fall back to full reconcile
+				changedDirs = nil
+			} else if len(changedDirs) > 0 {
+				slog.Info("changed deployment directories", "dirs", changedDirs)
+			}
+		}
+
 		state := metrics.NewState()
-		deployments, err := g.checkAndUpdateDeployments(state)
+		deployments, err := g.checkAndUpdateDeployments(state, changedDirs)
 		if err != nil {
 			slog.Error("error checking and updating deployments", "err", err)
 			g.metrics.TrackCheckStatus("error")
@@ -262,7 +311,8 @@ func (g *GitOps) CheckAndUpdate() {
 			slog.Info("no deployment changes necessary")
 		}
 	} else if len(g.retryDeployments) > 0 {
-		slog.Info("retrying deployments that previously failed due to image pull backoff", "count", len(g.retryDeployments))
+		slog.Info("retrying deployments that previously failed due to image pull backoff",
+			"count", len(g.retryDeployments))
 		state := metrics.NewState()
 		for _, d := range g.retryDeployments {
 			g.applyDeploymentChange(d, state)
