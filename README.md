@@ -200,16 +200,25 @@ usermod -aG docker gitops   # grant Docker socket access
 
 ### 3 — Lay out the directories
 
+`/opt` is root-owned, which is fine — the agent only needs ownership of its
+own subdirectories, not of `/opt` itself.
+
 ```bash
+# Create directories as root (normal for /opt)
 mkdir -p /opt/gitops/ssh /opt/deployments
 
 # Copy your SSH key pair (generated earlier)
 cp id_ed25519  /opt/gitops/ssh/id_ed25519
 cp known_hosts /opt/gitops/ssh/known_hosts
-chmod 600      /opt/gitops/ssh/id_ed25519
+
+# The key must be readable only by the gitops user
+chmod 700 /opt/gitops/ssh
+chmod 600 /opt/gitops/ssh/id_ed25519
+chmod 644 /opt/gitops/ssh/known_hosts
 chown -R gitops:gitops /opt/gitops
 
-# Clone the deployment repository once
+# Clone as root using the key we just placed, then hand ownership to gitops.
+# The agent runs git pull on /opt/deployments, so it must own the tree.
 GIT_SSH_COMMAND="ssh -i /opt/gitops/ssh/id_ed25519 -o IdentitiesOnly=yes \
   -o UserKnownHostsFile=/opt/gitops/ssh/known_hosts" \
   git clone git@ssh.dev.azure.com:v3/ORG/PROJECT/REPOSITORY /opt/deployments
@@ -253,6 +262,7 @@ RestartSec=10s
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+# /opt/deployments must be writable — git pull writes to the working tree
 ReadWritePaths=/opt/deployments
 
 [Install]
