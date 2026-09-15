@@ -112,12 +112,11 @@ func matchesChangedDirs(d *deployment.Deployment, changedDirs []string) bool {
 	deployDir := filepath.ToSlash(d.Dir())
 	for _, changed := range changedDirs {
 		changed = filepath.ToSlash(changed)
-		// Exact suffix or path suffix (with separator boundary)
-		if deployDir == changed ||
-			strings.HasSuffix(deployDir, "/"+changed) {
+		if deployDir == changed || strings.HasSuffix(deployDir, "/"+changed) {
 			return true
 		}
 	}
+	slog.Debug("deployment not in changed dirs", "deployment", deployDir, "changedDirs", changedDirs)
 	return false
 }
 
@@ -202,6 +201,20 @@ func (g *GitOps) checkAndUpdateDeployments(
 		if d.State != deployment.Removed {
 			if err := d.LoadConfig(); err != nil {
 				slog.Error("error loading deployment config", "file", d.Filepath, "err", err)
+			}
+		}
+	}
+
+	// If a deployment is in the changed dirs set but the compose-go hash didn't
+	// change (e.g. the changed variable is not used in interpolation, such as a
+	// raw image tag in .env that compose-go resolves to blank), force it to
+	// Updated so docker compose up is always run for git-changed deployments.
+	if len(changedDirs) > 0 {
+		for _, d := range deployments {
+			if d.State == deployment.Unchanged && matchesChangedDirs(d, changedDirs) {
+				slog.Debug("forcing re-deploy: git change detected but hash unchanged",
+					"file", d.Filepath)
+				d.State = deployment.Updated
 			}
 		}
 	}
