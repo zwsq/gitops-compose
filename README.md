@@ -26,31 +26,20 @@ gitops-compose
 
 ## How it works
 
-1. On start and on every poll interval, `git fetch` is run against the
-   configured remote.
-2. If the remote branch is ahead of local HEAD, the set of changed file paths
-   is computed.
-3. Each changed path is mapped to its deployment directory (the directory that
-   contains the `compose.yaml` or `docker-compose.yml` file).
-4. Only the affected deployments are reconciled — a change to
-   `beta/payments/.env` will not cause `beta/frontend` to be restarted.
-5. `git pull` is run, then `docker compose up -d` is called for each affected
-   deployment.
-6. If a deployment fails, the local Git revision is **not** advanced for that
-   deployment.  The next polling cycle will retry it automatically.
+1. On start and on every poll interval, `git fetch` is run against the configured remote.
+2. If the remote branch is ahead of local HEAD, the set of changed file paths is computed.
+3. Each changed path is mapped to its deployment directory (the directory that contains the `compose.yaml` or `docker-compose.yml` file).
+4. Only the affected deployments are reconciled — a change to `beta/payments/.env` will not cause `beta/frontend` to be restarted.
+5. `git pull` is run, then `docker compose up -d` is called for each affected deployment.
+6. If a deployment fails, the local Git revision is **not** advanced. The next polling cycle will retry automatically.
 
-> GitopsCompose exits early when the local repository is dirty.  When
-> reconciliation begins, errors are tracked per deployment but all deployments
-> continue to be processed (a failed stop does not block other updates).
+> GitopsCompose exits early when the local repository is dirty. When reconciliation begins, errors are tracked per deployment but all deployments continue to be processed.
 
 ---
 
 ## Repository layout
 
-The Git repository contains one or more independent Compose deployments
-organised in subdirectories.  Any directory structure is supported; a
-"deployment" is simply a directory that contains a `compose.yaml` or
-`docker-compose.yml` file.
+The Git repository contains one or more independent Compose deployments organised in subdirectories. Any directory structure is supported; a "deployment" is simply a directory that contains a `compose.yaml` or `docker-compose.yml` file.
 
 ```text
 deployments/
@@ -70,19 +59,17 @@ deployments/
     └── reporting/
 ```
 
-The CD pipeline builds and pushes a Docker image, then commits an image-tag
-update to the appropriate `.env`:
+The CD pipeline builds and pushes a Docker image, then commits an image-tag update to the appropriate `.env`:
 
 ```diff
 -PAYMENTS_IMAGE=registry.example.com/payments:1.42.7
 +PAYMENTS_IMAGE=registry.example.com/payments:1.42.8
 ```
 
-GitopsCompose detects the changed file (`beta/payments/.env`), maps it to the
-`beta/payments` deployment, and runs:
+GitopsCompose detects the changed file (`beta/payments/.env`), maps it to the `beta/payments` deployment, and runs:
 
 ```bash
-cd /deployments/beta/payments
+cd /opt/deployments/beta/payments
 docker compose -f compose.yaml up -d
 ```
 
@@ -90,92 +77,56 @@ Docker Compose then determines which containers need to be recreated.
 
 ### Compose file names
 
-Both `compose.yaml` and `docker-compose.yml` are supported.  When both exist
-in the same directory, `compose.yaml` is preferred.
+Both `compose.yaml` and `docker-compose.yml` are supported. When both exist in the same directory, `compose.yaml` is preferred.
 
 ---
 
-## Azure DevOps SSH setup
+## Installation and setup
 
-### 1 — Generate an SSH key pair
+Follow these steps in order.
 
-Generate a dedicated Ed25519 key for the GitOps agent.  Do **not** set a
-passphrase (the agent runs unattended).
+### Step 1 — Generate an SSH key pair
+
+On any machine, generate a dedicated Ed25519 key for the GitOps agent. Do **not** set a passphrase — the agent runs unattended.
 
 ```bash
 ssh-keygen -t ed25519 -C "gitops-compose" -f ./id_ed25519 -N ""
 ```
 
-This produces:
+This produces two files in the current directory:
 
 ```text
-id_ed25519      ← private key  (keep secret, mount into the container)
-id_ed25519.pub  ← public key   (add to Azure DevOps)
+id_ed25519      ← private key (keep secret)
+id_ed25519.pub  ← public key  (add to Azure DevOps)
 ```
 
-### 2 — Add the public key to Azure DevOps
+### Step 2 — Add the public key to Azure DevOps
 
-1. Open **User settings → SSH public keys** in your Azure DevOps organisation
-   (`https://dev.azure.com/<ORG>/_usersSettings/keys`).
+1. Open **User settings → SSH public keys** in your Azure DevOps organisation:
+   `https://dev.azure.com/<ORG>/_usersSettings/keys`
 2. Click **New Key**, paste the content of `id_ed25519.pub`, and save.
 
-### 3 — Build a known_hosts file
+### Step 3 — Build a known_hosts file
 
-Fetch the Azure DevOps SSH host key and save it to a `known_hosts` file:
+Fetch the Azure DevOps SSH host key and verify it before trusting it:
 
 ```bash
-ssh-keyscan -p 22 ssh.dev.azure.com >> ./known_hosts
+ssh-keyscan -p 22 ssh.dev.azure.com > ./known_hosts
 ```
 
-Verify the fingerprint matches the [published Azure DevOps SSH fingerprints](https://learn.microsoft.com/en-us/azure/devops/repos/git/use-ssh-keys-to-authenticate)
-before trusting it.
+Cross-check the fingerprint against the [published Azure DevOps SSH fingerprints](https://learn.microsoft.com/en-us/azure/devops/repos/git/use-ssh-keys-to-authenticate).
 
-### 4 — Find your SSH clone URL
+### Step 4 — Find your SSH clone URL
 
-In Azure DevOps, open the repository → **Clone** → **SSH**.  The URL looks
-like:
+In Azure DevOps: open the repository → **Clone** → **SSH**. The URL looks like:
 
 ```text
 git@ssh.dev.azure.com:v3/ORG/PROJECT/REPOSITORY
 ```
 
-### 5 — Clone the repository manually (first run)
+### Step 5 — Install the binary
 
-GitopsCompose expects the repository to already exist at `REPOSITORY_PATH`.
-Clone it once using the same key:
-
-```bash
-GIT_SSH_COMMAND="ssh -i /opt/ssh/id_ed25519 -o IdentitiesOnly=yes \
-  -o UserKnownHostsFile=/opt/ssh/known_hosts" \
-  git clone git@ssh.dev.azure.com:v3/ORG/PROJECT/REPOSITORY /opt/deployments
-```
-
-### 6 — Store the key files securely
-
-Place the key files in a directory that will be bind-mounted read-only into the
-container:
-
-```text
-/opt/gitops-compose/ssh/
-├── id_ed25519     (chmod 600)
-└── known_hosts
-```
-
-```bash
-chmod 600 /opt/gitops-compose/ssh/id_ed25519
-```
-
----
-
-## Deployment (binary + systemd)
-
-The recommended way to run gitops-compose is as a plain binary under systemd.
-No container overhead, no socket-in-socket complexity.
-
-### 1 — Install the binary
-
-Download the latest release binary for your architecture and place it on the
-host:
+On the host that will run the agent, download the release binary:
 
 ```bash
 # linux/amd64
@@ -191,41 +142,44 @@ curl -fsSL https://github.com/zwsq/gitops-compose/releases/latest/download/gitop
 chmod +x /usr/local/bin/gitops-compose
 ```
 
-### 2 — Create a dedicated user
+### Step 6 — Create a dedicated system user
 
 ```bash
 useradd --system --no-create-home --shell /usr/sbin/nologin gitops
 usermod -aG docker gitops   # grant Docker socket access
 ```
 
-### 3 — Lay out the directories
+### Step 7 — Place the SSH keys on the host
 
-`/opt` is root-owned, which is fine — the agent only needs ownership of its
-own subdirectories, not of `/opt` itself.
+`/opt` is root-owned — that is normal and expected. The agent only needs ownership of its own subdirectories.
 
 ```bash
-# Create directories as root (normal for /opt)
-mkdir -p /opt/gitops/ssh /opt/deployments
+mkdir -p /opt/gitops/ssh
 
-# Copy your SSH key pair (generated earlier)
+# Copy the key files generated in step 1
 cp id_ed25519  /opt/gitops/ssh/id_ed25519
 cp known_hosts /opt/gitops/ssh/known_hosts
 
-# The key must be readable only by the gitops user
+# Restrict permissions — ssh refuses keys that are group/world readable
 chmod 700 /opt/gitops/ssh
 chmod 600 /opt/gitops/ssh/id_ed25519
 chmod 644 /opt/gitops/ssh/known_hosts
 chown -R gitops:gitops /opt/gitops
+```
 
-# Clone as root using the key we just placed, then hand ownership to gitops.
-# The agent runs git pull on /opt/deployments, so it must own the tree.
+### Step 8 — Clone the deployment repository
+
+The agent expects the repository to already exist at `REPOSITORY_PATH`. Clone it once using the key just placed, then transfer ownership to the `gitops` user (the agent runs `git pull` here and needs write access to the working tree).
+
+```bash
 GIT_SSH_COMMAND="ssh -i /opt/gitops/ssh/id_ed25519 -o IdentitiesOnly=yes \
   -o UserKnownHostsFile=/opt/gitops/ssh/known_hosts" \
   git clone git@ssh.dev.azure.com:v3/ORG/PROJECT/REPOSITORY /opt/deployments
+
 chown -R gitops:gitops /opt/deployments
 ```
 
-### 4 — Create the environment file
+### Step 9 — Create the environment file
 
 ```bash
 cat > /etc/gitops-compose.env <<'EOF'
@@ -237,11 +191,12 @@ CHECK_INTERVAL_IN_SECONDS=30
 DOCKER_REGISTRIES=[{"url":"registry.example.com","username":"robot","password":"secret"}]
 LOG_FORMAT=json
 EOF
-chmod 600 /etc/gitops-compose.env
+
+chmod 600 /etc/gitops-compose.env     # contains registry credentials
 chown gitops:gitops /etc/gitops-compose.env
 ```
 
-### 5 — Create the systemd unit
+### Step 10 — Create the systemd unit
 
 ```ini
 # /etc/systemd/system/gitops-compose.service
@@ -262,7 +217,7 @@ RestartSec=10s
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-# /opt/deployments must be writable — git pull writes to the working tree
+# git pull writes to the working tree, so this path must be writable
 ReadWritePaths=/opt/deployments
 
 [Install]
@@ -279,39 +234,32 @@ journalctl -u gitops-compose -f
 
 ## Environment variables
 
-| Variable                  | Default | Required | Description |
-| ------------------------- | ------- | -------- | ----------- |
-| `REPOSITORY_PATH`         |         | **yes**  | Absolute path to the cloned Git repository |
-| `REPOSITORY_BRANCH`       | `main`  | no       | Branch to track |
-| `SSH_KEY_PATH`            |         | no       | Path to the SSH private key file (enables SSH auth) |
-| `SSH_KNOWN_HOSTS_PATH`    |         | no       | Path to a known_hosts file (recommended with SSH) |
-| `CHECK_INTERVAL_IN_SECONDS` | `300` | no       | Polling interval in seconds; `-1` disables polling |
-| `DOCKER_REGISTRIES`       | `[]`    | no       | JSON array: `[{"url":"…","username":"…","password":"…"}]` |
-| `WEBHOOK_ENABLED`         | `true`  | no       | Enables the `/webhook` endpoint |
-| `METRICS_ENABLED`         | `true`  | no       | Enables the `/metrics` endpoint |
-| `LOG_FORMAT`              | `text`  | no       | `text` (logfmt), `json`, or `console` |
-| `LOG_LEVEL`               | `info`  | no       | `debug`, `info`, `warn`, or `error` |
+| Variable                    | Default | Required | Description |
+| --------------------------- | ------- | -------- | ----------- |
+| `REPOSITORY_PATH`           |         | **yes**  | Absolute path to the cloned Git repository |
+| `REPOSITORY_BRANCH`         | `main`  | no       | Branch to track |
+| `SSH_KEY_PATH`              |         | no       | Path to the SSH private key (enables SSH auth) |
+| `SSH_KNOWN_HOSTS_PATH`      |         | no       | Path to a known_hosts file |
+| `CHECK_INTERVAL_IN_SECONDS` | `300`   | no       | Polling interval in seconds; `-1` disables polling |
+| `DOCKER_REGISTRIES`         | `[]`    | no       | JSON array: `[{"url":"…","username":"…","password":"…"}]` |
+| `WEBHOOK_ENABLED`           | `true`  | no       | Enables the `/webhook` endpoint |
+| `METRICS_ENABLED`           | `true`  | no       | Enables the `/metrics` endpoint |
+| `LOG_FORMAT`                | `text`  | no       | `text` (logfmt), `json`, or `console` |
+| `LOG_LEVEL`                 | `info`  | no       | `debug`, `info`, `warn`, or `error` |
 
-When `SSH_KEY_PATH` is set, SSH auth is used and any HTTP credentials embedded
-in the remote URL are ignored.  The private key is passed to the `ssh` binary
-via `GIT_SSH_COMMAND` and is **never logged**.
+When `SSH_KEY_PATH` is set, SSH auth is used and any HTTP credentials embedded in the remote URL are ignored. The private key is passed to the `ssh` binary via `GIT_SSH_COMMAND` and is **never logged**.
 
-SSH host key verification is always enabled.  `StrictHostKeyChecking=no` is
-intentionally not set.
+SSH host key verification is always enabled. `StrictHostKeyChecking=no` is intentionally not set.
 
 ---
 
 ## Polling and retry behaviour
 
 - GitopsCompose polls Git on a fixed interval (`CHECK_INTERVAL_IN_SECONDS`).
-- On each poll, only the deployments whose files changed since the last
-  successful sync are reconciled.
-- If `docker compose up` fails for a deployment, the local Git HEAD is **not**
-  advanced.  The next poll cycle will retry the deployment automatically.
-- Image pull failures are retried independently on each subsequent poll cycle
-  until a new Git change is detected.
-- The `/webhook` endpoint (`POST /webhook`) triggers an immediate check without
-  waiting for the next interval.
+- On each poll, only the deployments whose files changed since the last successful sync are reconciled.
+- If `docker compose up` fails for a deployment, the local Git HEAD is **not** advanced. The next poll cycle will retry the deployment automatically.
+- Image pull failures are retried independently on each subsequent poll cycle until a new Git change is detected.
+- The `/webhook` endpoint (`POST /webhook`) triggers an immediate check without waiting for the next interval.
 
 ---
 
@@ -328,8 +276,7 @@ Compose labels are set at the service level and affect the whole stack.
 
 ## Watch additional files
 
-To detect changes in files that are not loaded by Docker Compose automatically,
-use the `x-gitops` extension:
+To detect changes in files that are not loaded by Docker Compose automatically, use the `x-gitops` extension:
 
 ```yaml
 # Root-level watch
@@ -394,15 +341,10 @@ A prebuilt Grafana dashboard is available at [dashboard.json](dashboard.json).
 
 ## Limitations
 
-- The repository must be cloned manually before starting gitops-compose (no
-  auto-clone on first run).
-- HTTP basic-auth credentials embedded in the remote URL are supported for
-  backward-compatibility but SSH is preferred.
-- Rolling updates: images are pulled before containers are stopped.  If the
-  pull fails the containers remain running on the previous image and the
-  deployment is retried on the next poll.
-- Errors during removal of a stack (e.g. the compose file was deleted) may
-  leave containers running if `docker compose down` fails.
+- The repository must be cloned manually before starting gitops-compose (no auto-clone on first run).
+- HTTP basic-auth credentials embedded in the remote URL are supported for backward-compatibility but SSH is preferred.
+- Rolling updates: images are pulled before containers are stopped. If the pull fails, containers remain running on the previous image and the deployment is retried on the next poll.
+- Errors during removal of a stack (e.g. the compose file was deleted) may leave containers running if `docker compose down` fails.
 
 ---
 
