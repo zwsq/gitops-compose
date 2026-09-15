@@ -167,38 +167,103 @@ chmod 600 /opt/gitops-compose/ssh/id_ed25519
 
 ---
 
-## Docker deployment example
+## Deployment (binary + systemd)
 
-```yaml
-# /opt/gitops-compose/docker-compose.yml
-services:
-  gitops-compose:
-    image: ghcr.io/zwsq/gitops-compose:latest
-    container_name: gitops-compose
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:2112:2112"
-    user: "${UID}:${GID}"
-    group_add:
-      - "${GID_DOCKER}"
-    environment:
-      REPOSITORY_PATH: /deployments
-      REPOSITORY_BRANCH: beta
-      SSH_KEY_PATH: /ssh/id_ed25519
-      SSH_KNOWN_HOSTS_PATH: /ssh/known_hosts
-      CHECK_INTERVAL_IN_SECONDS: 30
-      DOCKER_REGISTRIES: '[{"url":"registry.example.com","username":"robot","password":"secret"}]'
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/deployments:/deployments
-      - /opt/gitops-compose/ssh:/ssh:ro
+The recommended way to run gitops-compose is as a plain binary under systemd.
+No container overhead, no socket-in-socket complexity.
+
+### 1 — Install the binary
+
+Download the latest release binary for your architecture and place it on the
+host:
+
+```bash
+# linux/amd64
+curl -fsSL https://github.com/zwsq/gitops-compose/releases/latest/download/gitops-compose-linux-amd64 \
+  -o /usr/local/bin/gitops-compose
+chmod +x /usr/local/bin/gitops-compose
 ```
 
-> **Docker socket permission note** — the container user needs access to
-> `/var/run/docker.sock`.  The standard approach is to add the user to the
-> `docker` group (`group_add: ["${GID_DOCKER}"]`).  On hosts where the socket
-> is owned by a different GID, adjust accordingly.  Running the container as
-> root is not required and not recommended.
+```bash
+# linux/arm64
+curl -fsSL https://github.com/zwsq/gitops-compose/releases/latest/download/gitops-compose-linux-arm64 \
+  -o /usr/local/bin/gitops-compose
+chmod +x /usr/local/bin/gitops-compose
+```
+
+### 2 — Create a dedicated user
+
+```bash
+useradd --system --no-create-home --shell /usr/sbin/nologin gitops
+usermod -aG docker gitops   # grant Docker socket access
+```
+
+### 3 — Lay out the directories
+
+```bash
+mkdir -p /opt/gitops/ssh /opt/deployments
+
+# Copy your SSH key pair (generated earlier)
+cp id_ed25519  /opt/gitops/ssh/id_ed25519
+cp known_hosts /opt/gitops/ssh/known_hosts
+chmod 600      /opt/gitops/ssh/id_ed25519
+chown -R gitops:gitops /opt/gitops
+
+# Clone the deployment repository once
+GIT_SSH_COMMAND="ssh -i /opt/gitops/ssh/id_ed25519 -o IdentitiesOnly=yes \
+  -o UserKnownHostsFile=/opt/gitops/ssh/known_hosts" \
+  git clone git@ssh.dev.azure.com:v3/ORG/PROJECT/REPOSITORY /opt/deployments
+chown -R gitops:gitops /opt/deployments
+```
+
+### 4 — Create the environment file
+
+```bash
+cat > /etc/gitops-compose.env <<'EOF'
+REPOSITORY_PATH=/opt/deployments
+REPOSITORY_BRANCH=main
+SSH_KEY_PATH=/opt/gitops/ssh/id_ed25519
+SSH_KNOWN_HOSTS_PATH=/opt/gitops/ssh/known_hosts
+CHECK_INTERVAL_IN_SECONDS=30
+DOCKER_REGISTRIES=[{"url":"registry.example.com","username":"robot","password":"secret"}]
+LOG_FORMAT=json
+EOF
+chmod 600 /etc/gitops-compose.env
+chown gitops:gitops /etc/gitops-compose.env
+```
+
+### 5 — Create the systemd unit
+
+```ini
+# /etc/systemd/system/gitops-compose.service
+[Unit]
+Description=GitOps Compose agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=gitops
+Group=gitops
+EnvironmentFile=/etc/gitops-compose.env
+ExecStart=/usr/local/bin/gitops-compose
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/deployments
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now gitops-compose
+journalctl -u gitops-compose -f
+```
 
 ---
 
@@ -216,7 +281,6 @@ services:
 | `METRICS_ENABLED`         | `true`  | no       | Enables the `/metrics` endpoint |
 | `LOG_FORMAT`              | `text`  | no       | `text` (logfmt), `json`, or `console` |
 | `LOG_LEVEL`               | `info`  | no       | `debug`, `info`, `warn`, or `error` |
-| `IS_RUNNING_IN_DOCKER`    | `false` | no       | Set automatically in the official image |
 
 When `SSH_KEY_PATH` is set, SSH auth is used and any HTTP credentials embedded
 in the remote URL are ignored.  The private key is passed to the `ssh` binary
@@ -315,20 +379,6 @@ gitops_deployments_operations_total{operation="failed"} 0
 A prebuilt Grafana dashboard is available at [dashboard.json](dashboard.json).
 
 ![Grafana dashboard screenshot](dashboard.png)
-
----
-
-## Container image
-
-Images are published to the GitHub Container Registry:
-
-```text
-ghcr.io/zwsq/gitops-compose:latest      ← latest main build
-ghcr.io/zwsq/gitops-compose:v1.2.3      ← specific release
-ghcr.io/zwsq/gitops-compose:sha-abc1234  ← immutable SHA tag
-```
-
-Multi-architecture manifest covers `linux/amd64` and `linux/arm64`.
 
 ---
 
