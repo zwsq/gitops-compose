@@ -252,6 +252,49 @@ func TestChangedDeploymentDirs_NoChanges(t *testing.T) {
 	}
 }
 
+func TestChangedDeploymentDirs_PrefixFiltersOutOtherDirs(t *testing.T) {
+	bareDir, cloneDir, _ := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+
+	// Change is outside the watched prefix
+	pushCommit(t, second, "other/service/.env", "IMG=v2", "main")
+	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
+
+	repo, err := NewDeploymentRepo(cloneDir, WithBranch("main"), WithDeploymentsPath("deployments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dirs, err := repo.ChangedDeploymentDirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirs) != 0 {
+		t.Errorf("expected no dirs when change is outside prefix, got %v", dirs)
+	}
+}
+
+func TestChangedDeploymentDirs_PrefixAllowsMatchingDir(t *testing.T) {
+	bareDir, cloneDir, _ := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+
+	pushCommit(t, second, "deployments/payments/.env", "IMG=v2", "main")
+	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
+
+	repo, err := NewDeploymentRepo(cloneDir, WithBranch("main"), WithDeploymentsPath("deployments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dirs, err := repo.ChangedDeploymentDirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsDir(dirs, "deployments/payments") {
+		t.Errorf("expected 'deployments/payments' in dirs, got %v", dirs)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // deploymentDirFromPath unit tests (pure function, no I/O)
 // ---------------------------------------------------------------------------

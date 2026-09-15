@@ -4,6 +4,7 @@
 //   - SSH key auth via GIT_SSH_COMMAND (Azure DevOps and similar)
 //   - Configurable tracking branch (default: main)
 //   - Changed-path detection between two commits
+//   - Optional subdirectory scoping (only watch a subtree of the repo)
 package git
 
 import (
@@ -39,6 +40,11 @@ type DeploymentRepo struct {
 
 	// Branch being tracked (e.g. "main", "beta")
 	branch string
+
+	// Optional subdirectory prefix (relative to repo root, e.g. "deployments").
+	// When set, only files under this prefix are considered.  Empty means watch
+	// the entire repository.
+	deploymentsPrefix string
 }
 
 type DeploymentRepoOption func(*DeploymentRepo)
@@ -72,6 +78,21 @@ func WithBranch(branch string) DeploymentRepoOption {
 		if branch != "" {
 			r.branch = branch
 		}
+	}
+}
+
+// WithDeploymentsPath restricts change detection and compose-file discovery to
+// a subdirectory of the repository (relative path, e.g. "deployments" or
+// "infra/compose").  Files outside this prefix are ignored entirely.
+// An empty value (the default) watches the whole repository.
+func WithDeploymentsPath(subdir string) DeploymentRepoOption {
+	return func(r *DeploymentRepo) {
+		// Normalise: strip leading/trailing slashes, convert backslashes
+		subdir = path.Clean(strings.Trim(filepath.ToSlash(subdir), "/"))
+		if subdir == "." {
+			subdir = ""
+		}
+		r.deploymentsPrefix = subdir
 	}
 }
 
@@ -309,6 +330,12 @@ func (r *DeploymentRepo) ChangedDeploymentDirs() ([]string, error) {
 			if f == (object.File{}) {
 				continue
 			}
+			// Skip files outside the configured subdirectory prefix.
+			if r.deploymentsPrefix != "" {
+				if !strings.HasPrefix(f.Name, r.deploymentsPrefix+"/") {
+					continue
+				}
+			}
 			dir := deploymentDirFromPath(f.Name)
 			if dir != "" {
 				seen[dir] = struct{}{}
@@ -361,6 +388,13 @@ func (r *DeploymentRepo) filterComposeFiles(c object.Commit) ([]string, error) {
 	dirToFile := map[string]string{}
 
 	err = tree.Files().ForEach(func(f *object.File) error {
+		// Skip files outside the configured subdirectory prefix.
+		if r.deploymentsPrefix != "" {
+			if !strings.HasPrefix(f.Name, r.deploymentsPrefix+"/") {
+				return nil
+			}
+		}
+
 		base := path.Base(f.Name)
 		dir := path.Dir(f.Name)
 		if dir == "." {

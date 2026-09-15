@@ -23,6 +23,11 @@ type Config struct {
 	// Local path where the Git repository is (or will be) cloned.
 	RepositoryPath string `required:"true" split_words:"true"`
 
+	// Optional subdirectory inside the repository to watch. When set, only
+	// changes under this path trigger deployments. Empty means watch the
+	// entire repository.
+	DeploymentsPath string `split_words:"true"`
+
 	// Branch to track. Defaults to "main" for backward-compatibility.
 	RepositoryBranch string `default:"main" split_words:"true"`
 

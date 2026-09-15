@@ -54,6 +54,12 @@ func main() {
 		git.WithBranch(c.RepositoryBranch),
 	}
 
+	if c.DeploymentsPath != "" {
+		deploymentRepoOptions = append(deploymentRepoOptions,
+			git.WithDeploymentsPath(c.DeploymentsPath))
+		slog.Info("scoping deployments to subdirectory", "path", c.DeploymentsPath)
+	}
+
 	if c.SSHEnabled() {
 		slog.Info("SSH auth configured", "key", c.SSHKeyPath)
 		deploymentRepoOptions = append(deploymentRepoOptions,

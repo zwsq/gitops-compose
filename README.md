@@ -81,42 +81,49 @@ Both `compose.yaml` and `docker-compose.yml` are supported. When both exist in t
 
 ---
 
-## Installation and setup
+## Setup
 
-Follow these steps in order.
+Setup has two phases:
 
-### Step 1 — Generate an SSH key pair
+- **Phase A** — Azure DevOps account configuration (done once, from any machine)
+- **Phase B** — Host installation (done on the server that will run the agent)
 
-On any machine, generate a dedicated Ed25519 key for the GitOps agent. Do **not** set a passphrase — the agent runs unattended.
+---
+
+### Phase A — Azure DevOps
+
+#### A1 — Generate an SSH key pair
+
+Do **not** set a passphrase — the agent runs unattended.
+
+**Azure DevOps Server (on-premises)** only accepts RSA keys:
+
+```bash
+ssh-keygen -t rsa -b 4096 -C "gitops-compose" -f ./id_rsa -N ""
+```
+
+**Azure DevOps Services (cloud)** also supports Ed25519:
 
 ```bash
 ssh-keygen -t ed25519 -C "gitops-compose" -f ./id_ed25519 -N ""
 ```
 
-This produces two files in the current directory:
+The rest of this guide uses `id_rsa` / `id_rsa.pub`. Substitute `id_ed25519` / `id_ed25519.pub` if you are on the cloud service.
+
+The two generated files:
 
 ```text
-id_ed25519      ← private key (keep secret)
-id_ed25519.pub  ← public key  (add to Azure DevOps)
+id_rsa      ← private key  (copy to the host in phase B)
+id_rsa.pub  ← public key   (add to Azure DevOps below)
 ```
 
-### Step 2 — Add the public key to Azure DevOps
+#### A2 — Add the public key to Azure DevOps
 
-1. Open **User settings → SSH public keys** in your Azure DevOps organisation:
+1. Open **User settings → SSH public keys**:
    `https://dev.azure.com/<ORG>/_usersSettings/keys`
-2. Click **New Key**, paste the content of `id_ed25519.pub`, and save.
+2. Click **New Key**, paste the contents of `id_ed25519.pub`, and save.
 
-### Step 3 — Build a known_hosts file
-
-Fetch the Azure DevOps SSH host key and verify it before trusting it:
-
-```bash
-ssh-keyscan -p 22 ssh.dev.azure.com > ./known_hosts
-```
-
-Cross-check the fingerprint against the [published Azure DevOps SSH fingerprints](https://learn.microsoft.com/en-us/azure/devops/repos/git/use-ssh-keys-to-authenticate).
-
-### Step 4 — Find your SSH clone URL
+#### A3 — Note the SSH clone URL
 
 In Azure DevOps: open the repository → **Clone** → **SSH**. The URL looks like:
 
@@ -124,9 +131,13 @@ In Azure DevOps: open the repository → **Clone** → **SSH**. The URL looks li
 git@ssh.dev.azure.com:v3/ORG/PROJECT/REPOSITORY
 ```
 
-### Step 5 — Install the binary
+---
 
-On the host that will run the agent, download the release binary:
+### Phase B — Host installation
+
+All commands below run as **root** on the target host unless stated otherwise.
+
+#### B1 — Install the binary
 
 ```bash
 # linux/amd64
@@ -142,50 +153,54 @@ curl -fsSL https://github.com/zwsq/gitops-compose/releases/latest/download/gitop
 chmod +x /usr/local/bin/gitops-compose
 ```
 
-### Step 6 — Create a dedicated system user
+#### B2 — Create a dedicated system user
 
 ```bash
 useradd --system --no-create-home --shell /usr/sbin/nologin gitops
 usermod -aG docker gitops   # grant Docker socket access
 ```
 
-### Step 7 — Place the SSH keys on the host
+#### B3 — Place the SSH keys
 
-`/opt` is root-owned — that is normal and expected. The agent only needs ownership of its own subdirectories.
+`/opt` is root-owned — that is normal. The agent only needs ownership of its own subdirectories.
 
 ```bash
 mkdir -p /opt/gitops/ssh
 
-# Copy the key files generated in step 1
-cp id_ed25519  /opt/gitops/ssh/id_ed25519
-cp known_hosts /opt/gitops/ssh/known_hosts
+# Copy the files generated in phase A
+cp id_rsa     /opt/gitops/ssh/id_rsa
+cp id_rsa.pub /opt/gitops/ssh/id_rsa.pub
+
+# Fetch the host key and verify the fingerprint against:
+# https://learn.microsoft.com/en-us/azure/devops/repos/git/use-ssh-keys-to-authenticate
+ssh-keyscan -p 22 ssh.dev.azure.com > /opt/gitops/ssh/known_hosts
 
 # Restrict permissions — ssh refuses keys that are group/world readable
 chmod 700 /opt/gitops/ssh
-chmod 600 /opt/gitops/ssh/id_ed25519
-chmod 644 /opt/gitops/ssh/known_hosts
+chmod 600 /opt/gitops/ssh/id_rsa
+chmod 644 /opt/gitops/ssh/id_rsa.pub /opt/gitops/ssh/known_hosts
 chown -R gitops:gitops /opt/gitops
 ```
 
-### Step 8 — Clone the deployment repository
+#### B4 — Clone the deployment repository
 
-The agent expects the repository to already exist at `REPOSITORY_PATH`. Clone it once using the key just placed, then transfer ownership to the `gitops` user (the agent runs `git pull` here and needs write access to the working tree).
+The agent expects the repository to already exist at `REPOSITORY_PATH`. Clone it once, then transfer ownership to the `gitops` user — the agent runs `git pull` here and needs write access to the working tree.
 
 ```bash
-GIT_SSH_COMMAND="ssh -i /opt/gitops/ssh/id_ed25519 -o IdentitiesOnly=yes \
+GIT_SSH_COMMAND="ssh -i /opt/gitops/ssh/id_rsa -o IdentitiesOnly=yes \
   -o UserKnownHostsFile=/opt/gitops/ssh/known_hosts" \
   git clone git@ssh.dev.azure.com:v3/ORG/PROJECT/REPOSITORY /opt/deployments
 
 chown -R gitops:gitops /opt/deployments
 ```
 
-### Step 9 — Create the environment file
+#### B5 — Create the environment file
 
 ```bash
 cat > /etc/gitops-compose.env <<'EOF'
 REPOSITORY_PATH=/opt/deployments
 REPOSITORY_BRANCH=main
-SSH_KEY_PATH=/opt/gitops/ssh/id_ed25519
+SSH_KEY_PATH=/opt/gitops/ssh/id_rsa
 SSH_KNOWN_HOSTS_PATH=/opt/gitops/ssh/known_hosts
 CHECK_INTERVAL_IN_SECONDS=30
 DOCKER_REGISTRIES=[{"url":"registry.example.com","username":"robot","password":"secret"}]
@@ -196,7 +211,7 @@ chmod 600 /etc/gitops-compose.env     # contains registry credentials
 chown gitops:gitops /etc/gitops-compose.env
 ```
 
-### Step 10 — Create the systemd unit
+#### B6 — Create the systemd unit
 
 ```ini
 # /etc/systemd/system/gitops-compose.service
@@ -257,7 +272,7 @@ SSH host key verification is always enabled. `StrictHostKeyChecking=no` is inten
 
 - GitopsCompose polls Git on a fixed interval (`CHECK_INTERVAL_IN_SECONDS`).
 - On each poll, only the deployments whose files changed since the last successful sync are reconciled.
-- If `docker compose up` fails for a deployment, the local Git HEAD is **not** advanced. The next poll cycle will retry the deployment automatically.
+- If `docker compose up` fails for a deployment, the local Git HEAD is **not** advanced. The next poll cycle will retry automatically.
 - Image pull failures are retried independently on each subsequent poll cycle until a new Git change is detected.
 - The `/webhook` endpoint (`POST /webhook`) triggers an immediate check without waiting for the next interval.
 
