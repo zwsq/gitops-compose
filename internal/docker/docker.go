@@ -151,10 +151,8 @@ func (d Docker) Pull(imageName string) error {
 	if err != nil {
 		slog.Warn("failed to check if image exists locally", "image", imageName, "error", err)
 	}
-
-	// If the image already exists locally, no need to pull it again
 	if exists {
-		return nil
+		slog.Debug("image exists locally, pulling to refresh", "name", imageName)
 	}
 
 	// Try pulling with registry credentials

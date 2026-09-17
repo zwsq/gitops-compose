@@ -120,16 +120,39 @@ func matchesChangedDirs(d *deployment.Deployment, changedDirs []string) bool {
 	return false
 }
 
+func (g *GitOps) isRetry(d *deployment.Deployment) bool {
+	for _, r := range g.retryDeployments {
+		if r.Filepath == d.Filepath {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldRetry(d *deployment.Deployment) bool {
+	if d == nil || d.Error == nil {
+		return false
+	}
+	return d.Error != deployment.ErrInvalidComposeFile
+}
+
+func (g *GitOps) inScope(d *deployment.Deployment, changedDirs []string, incremental bool) bool {
+	if !incremental {
+		return true
+	}
+	return matchesChangedDirs(d, changedDirs) || g.isRetry(d)
+}
+
 // checkAndUpdateDeployments reconciles local compose deployments against the
 // remote Git state.
 //
-// When changedDirs is non-empty (incremental update), only deployments whose
-// directory appears in changedDirs are reconciled; all others are left alone.
-// When changedDirs is empty (first-run / forced full reconcile), all
-// deployments are reconciled.
+// When incremental is false (first-run / error fallback), every deployment is
+// reconciled. When incremental is true, only deployments in changedDirs plus
+// previously failed retries are reconciled.
 func (g *GitOps) checkAndUpdateDeployments(
 	state *metrics.DeploymentState,
 	changedDirs []string,
+	incremental bool,
 ) ([]*deployment.Deployment, error) {
 
 	localComposeFiles, err := g.repo.GetLocalComposeFiles()
@@ -181,7 +204,7 @@ func (g *GitOps) checkAndUpdateDeployments(
 		if d.State != deployment.Removed {
 			continue
 		}
-		if len(changedDirs) > 0 && !matchesChangedDirs(d, changedDirs) {
+		if !g.inScope(d, changedDirs, incremental) {
 			continue
 		}
 		g.applyDeploymentChange(d, state)
@@ -209,10 +232,10 @@ func (g *GitOps) checkAndUpdateDeployments(
 	// change (e.g. the changed variable is not used in interpolation, such as a
 	// raw image tag in .env that compose-go resolves to blank), force it to
 	// Updated so docker compose up is always run for git-changed deployments.
-	if len(changedDirs) > 0 {
+	if incremental {
 		for _, d := range deployments {
-			if d.State == deployment.Unchanged && matchesChangedDirs(d, changedDirs) {
-				slog.Debug("forcing re-deploy: git change detected but hash unchanged",
+			if d.State == deployment.Unchanged && g.inScope(d, changedDirs, incremental) {
+				slog.Debug("forcing re-deploy: git change or retry with hash unchanged",
 					"file", d.Filepath)
 				d.State = deployment.Updated
 			}
@@ -224,8 +247,7 @@ func (g *GitOps) checkAndUpdateDeployments(
 		if d.IsIgnored() || d.IsController() || d.State == deployment.Removed {
 			continue
 		}
-		// In incremental mode, skip deployments that are not in the changed set.
-		if len(changedDirs) > 0 && !matchesChangedDirs(d, changedDirs) {
+		if incremental && !g.inScope(d, changedDirs, incremental) {
 			state.Unchanged++
 			continue
 		}
@@ -283,28 +305,43 @@ func (g *GitOps) CheckAndUpdate() {
 	defer func() {
 		g.retryDeployments = newRetryDeployments
 		for _, d := range g.retryDeployments {
-			slog.Info("scheduling deployment for retry due to image pull backoff", "file", d.Filepath)
+			slog.Info("scheduling deployment for retry", "file", d.Filepath, "err", d.Error)
 		}
 	}()
 
 	if hasChanges || g.isFirstCheck {
-		// Determine which deployment directories actually changed.
-		// On first run we pass an empty slice so that all deployments are
-		// reconciled (full reconcile).
+		// First run: full reconcile (incremental=false).
+		// Later polls: incremental; empty changedDirs means no in-scope
+		// compose deployments changed (pull to advance HEAD, skip apply
+		// unless a previous failure is queued for retry).
 		var changedDirs []string
+		incremental := false
 		if hasChanges && !g.isFirstCheck {
 			changedDirs, err = g.repo.ChangedDeploymentDirs()
 			if err != nil {
 				slog.Error("error computing changed deployment dirs", "err", err)
-				// Fall back to full reconcile
 				changedDirs = nil
-			} else if len(changedDirs) > 0 {
-				slog.Info("changed deployment directories", "dirs", changedDirs)
+				incremental = false
+			} else {
+				incremental = true
+				if len(changedDirs) > 0 {
+					slog.Info("changed deployment directories", "dirs", changedDirs)
+				}
 			}
 		}
 
+		if incremental && len(changedDirs) == 0 && len(g.retryDeployments) == 0 {
+			if err := g.repo.Pull(); err != nil {
+				slog.Error("error pulling changes", "err", err)
+				g.metrics.TrackCheckStatus("error")
+				return
+			}
+			slog.Info("git changes outside watched deployments path, skipping apply")
+			return
+		}
+
 		state := metrics.NewState()
-		deployments, err := g.checkAndUpdateDeployments(state, changedDirs)
+		deployments, err := g.checkAndUpdateDeployments(state, changedDirs, incremental)
 		if err != nil {
 			slog.Error("error checking and updating deployments", "err", err)
 			g.metrics.TrackCheckStatus("error")
@@ -313,7 +350,7 @@ func (g *GitOps) CheckAndUpdate() {
 		g.metrics.TrackState(state, true)
 
 		for _, d := range deployments {
-			if d.Error == deployment.ErrImagePullBackoff {
+			if shouldRetry(d) {
 				newRetryDeployments = append(newRetryDeployments, d)
 			}
 		}
@@ -324,12 +361,12 @@ func (g *GitOps) CheckAndUpdate() {
 			slog.Info("no deployment changes necessary")
 		}
 	} else if len(g.retryDeployments) > 0 {
-		slog.Info("retrying deployments that previously failed due to image pull backoff",
+		slog.Info("retrying previously failed deployments",
 			"count", len(g.retryDeployments))
 		state := metrics.NewState()
 		for _, d := range g.retryDeployments {
 			g.applyDeploymentChange(d, state)
-			if d.Error == deployment.ErrImagePullBackoff {
+			if shouldRetry(d) {
 				newRetryDeployments = append(newRetryDeployments, d)
 			}
 		}

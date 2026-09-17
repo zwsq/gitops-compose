@@ -18,24 +18,37 @@ import (
 	"github.com/korbiniankuhn/gitops-compose/internal/metrics"
 )
 
-func panicOnError(message string, err error) {
+func exitOnError(message string, err error) {
 	if err != nil {
 		slog.Error(message, "error", err)
-		panic(err)
+		os.Exit(1)
+	}
+}
+
+func enqueueCheck(check chan struct{}) {
+	select {
+	case check <- struct{}{}:
+	default:
 	}
 }
 
 func main() {
+	code, stop := parseArgs(os.Args[1:], os.Stdout, os.Stderr)
+	if stop {
+		os.Exit(code)
+	}
+
 	// Default logger (will be overwritten during config load)
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
-	// Load config
 	c, err := config.Get()
-	panicOnError("failed to load config", err)
+	if err != nil {
+		printConfigError(err)
+		os.Exit(1)
+	}
 
-	// Set logger
 	switch c.LogFormat {
 	case "text":
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -49,7 +62,6 @@ func main() {
 		slog.SetLogLoggerLevel(slog.Level(c.LogLevel))
 	}
 
-	// Build git repo options based on the configured auth method
 	deploymentRepoOptions := []git.DeploymentRepoOption{
 		git.WithBranch(c.RepositoryBranch),
 	}
@@ -72,76 +84,57 @@ func main() {
 	}
 
 	r, err := git.NewDeploymentRepo(c.RepositoryPath, deploymentRepoOptions...)
-	panicOnError("failed to create deployment repo", err)
+	exitOnError("failed to create deployment repo", err)
 	slog.Info("deployment repo initialised", "path", c.RepositoryPath)
 
-	// Verify git remote access
-	panicOnError("failed to verify git remote access", r.VerifyRemoteAccess())
-	panicOnError("failed to verify git cli", r.VerifyGitCli())
+	exitOnError("failed to verify git remote access", r.VerifyRemoteAccess())
+	exitOnError("failed to verify git cli", r.VerifyGitCli())
 	slog.Info("git remote access verified")
 
-	// Verify docker socket connection
 	d := docker.NewDocker(c.DockerRegistries)
-	panicOnError("failed to verify docker socket connection", d.VerifySocketConnection())
+	exitOnError("failed to verify docker socket connection", d.VerifySocketConnection())
 	slog.Info("docker socket connection verified")
 
-	// Warn if dockerised gitops-compose is running on docker desktop
 	if c.IsRunningInDocker {
 		isDockerDesktop, err := d.IsDockerDesktop()
-		panicOnError("failed to verify if docker is running in docker desktop", err)
+		exitOnError("failed to verify if docker is running in docker desktop", err)
 		if isDockerDesktop {
 			slog.Warn("docker is running in docker desktop (volume mounts might cause issues)")
 		}
 	}
 
-	// Verify docker credentials (if set)
 	loggedIn, err := d.LoginIfCredentialsSet()
-	panicOnError("failed to verify docker registry credentials", err)
+	exitOnError("failed to verify docker registry credentials", err)
 	if loggedIn {
 		slog.Info("docker registry credentials verified")
 	}
 
-	// Initialise metrics
 	m := metrics.NewMetrics()
 	if c.MetricsEnabled {
 		http.Handle("/metrics", m.GetMetricsHandler())
 		slog.Info("metrics enabled", "url", "/metrics")
 	}
 
-	// Initialise gitops
 	g := gitops.NewGitOps(r, d, m)
 
-	wg := sync.WaitGroup{}
-	check := make(chan struct{})
+	stopCh := make(chan struct{})
+	check := make(chan struct{}, 1)
 
-	// Run gitops check on trigger
+	var wg sync.WaitGroup
+
 	wg.Add(1)
 	go func() {
-		for range check {
-			g.CheckAndUpdate()
+		defer wg.Done()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-check:
+				g.CheckAndUpdate()
+			}
 		}
-		wg.Done()
 	}()
 
-	// Run check on start
-	check <- struct{}{}
-
-	// Run gitops check on interval
-	if c.CheckIntervalInSeconds > 0 {
-		slog.Info("starting gitops repeated pull",
-			"interval", fmt.Sprintf("%ds", c.CheckIntervalInSeconds))
-		go func() {
-			ticker := time.NewTicker(time.Duration(c.CheckIntervalInSeconds) * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				check <- struct{}{}
-			}
-		}()
-	} else {
-		slog.Info("skipping gitops repeated pull (check interval is negative)")
-	}
-
-	// Webhook to trigger deployments
 	if c.WebhookEnabled {
 		http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
 			select {
@@ -155,43 +148,59 @@ func main() {
 		slog.Info("webhook enabled", "url", "/webhook")
 	}
 
-	// Health check endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	slog.Info("health check endpoint", "url", "/health")
 
-	// Start http server
 	s := http.Server{
 		Addr: ":2112",
 	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-
 		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			panicOnError("failed to start http server", err)
+			slog.Error("failed to start http server", "error", err)
+			os.Exit(1)
 		}
 	}()
 	slog.Info("http server started", "port", "2112")
 
-	// Wait for termination signal
+	enqueueCheck(check)
+
+	if c.CheckIntervalInSeconds > 0 {
+		slog.Info("starting gitops repeated pull",
+			"interval", fmt.Sprintf("%ds", c.CheckIntervalInSeconds))
+		go func() {
+			ticker := time.NewTicker(time.Duration(c.CheckIntervalInSeconds) * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopCh:
+					return
+				case <-ticker.C:
+					enqueueCheck(check)
+				}
+			}
+		}()
+	} else {
+		slog.Info("skipping gitops repeated pull (check interval is negative)")
+	}
+
 	osSignal := make(chan os.Signal, 1)
 	signal.Notify(osSignal, syscall.SIGINT, syscall.SIGTERM)
 
 	<-osSignal
 	slog.Info("received termination signal, shutting down")
 
-	close(check)
+	close(stopCh)
 
-	// Stop http server
 	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
 	defer cancel()
 	if err := s.Shutdown(ctx); err != nil {
-		panicOnError("failed to shutdown http server", err)
+		slog.Error("failed to shutdown http server", "error", err)
 	}
 
-	// Run until shutdown is complete
 	wg.Wait()
 	slog.Info("gitops compose gracefully stopped")
 }

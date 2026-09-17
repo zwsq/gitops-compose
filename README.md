@@ -3,8 +3,10 @@
 GitopsCompose is a GitOps continuous delivery tool for single-node Docker Compose deployments.
 
 It polls a Git repository (including **Azure DevOps over SSH**), detects which
-deployment directories changed, and runs `docker compose up -d` for those
+deployment directories changed, and runs `docker compose up` for those
 deployments only.
+
+Run `gitops-compose --help` for flags and environment variables.
 
 ```text
 Azure DevOps Git (or any Git remote)
@@ -28,10 +30,10 @@ gitops-compose
 
 1. On start and on every poll interval, `git fetch` is run against the configured remote.
 2. If the remote branch is ahead of local HEAD, the set of changed file paths is computed.
-3. Each changed path is mapped to its deployment directory (the directory that contains the `compose.yaml` or `docker-compose.yml` file).
-4. Only the affected deployments are reconciled — a change to `beta/payments/.env` will not cause `beta/frontend` to be restarted.
-5. `git pull` is run, then `docker compose up -d` is called for each affected deployment.
-6. If a deployment fails, the local Git revision is **not** advanced. The next polling cycle will retry automatically.
+3. Each changed path is mapped to the nearest ancestor directory that contains a `compose.yaml` or `docker-compose.yml` file.
+4. Only the affected deployments are reconciled — a change to `beta/payments/.env` will not cause `beta/frontend` to be restarted. Nested files such as `beta/payments/config/app.conf` still map to `beta/payments`.
+5. `git pull` is run, then `docker compose up` is called for each affected deployment.
+6. If a deployment fails after the pull, it is retried on the next poll even if there are no new Git commits.
 
 > GitopsCompose exits early when the local repository is dirty. When reconciliation begins, errors are tracked per deployment but all deployments continue to be processed.
 
@@ -253,6 +255,7 @@ journalctl -u gitops-compose -f
 | --------------------------- | ------- | -------- | ----------- |
 | `REPOSITORY_PATH`           |         | **yes**  | Absolute path to the cloned Git repository |
 | `REPOSITORY_BRANCH`         | `main`  | no       | Branch to track |
+| `DEPLOYMENTS_PATH`          |         | no       | Subdirectory to watch recursively; files outside this path are ignored |
 | `SSH_KEY_PATH`              |         | no       | Path to the SSH private key (enables SSH auth) |
 | `SSH_KNOWN_HOSTS_PATH`      |         | no       | Path to a known_hosts file |
 | `CHECK_INTERVAL_IN_SECONDS` | `300`   | no       | Polling interval in seconds; `-1` disables polling |
@@ -272,9 +275,21 @@ SSH host key verification is always enabled. `StrictHostKeyChecking=no` is inten
 
 - GitopsCompose polls Git on a fixed interval (`CHECK_INTERVAL_IN_SECONDS`).
 - On each poll, only the deployments whose files changed since the last successful sync are reconciled.
-- If `docker compose up` fails for a deployment, the local Git HEAD is **not** advanced. The next poll cycle will retry automatically.
-- Image pull failures are retried independently on each subsequent poll cycle until a new Git change is detected.
+- When `DEPLOYMENTS_PATH` is set, only that subtree is watched. Commits that only touch other directories still fast-forward the clone, but they do not reconcile any stack.
+- Git is pulled before compose is applied so the working tree matches remote. If apply fails, that deployment is retried on the next poll even if there are no new Git commits.
+- Image pull failures are retried on each subsequent poll until the pull succeeds or a new Git change is applied.
 - The `/webhook` endpoint (`POST /webhook`) triggers an immediate check without waiting for the next interval.
+
+---
+
+## Command line
+
+```bash
+gitops-compose --help
+gitops-compose --version
+```
+
+Missing or invalid configuration prints the error and the same usage text, then exits with status 1 (no panic). Unknown flags exit with status 2.
 
 ---
 
@@ -358,7 +373,7 @@ A prebuilt Grafana dashboard is available at [dashboard.json](dashboard.json).
 
 - The repository must be cloned manually before starting gitops-compose (no auto-clone on first run).
 - HTTP basic-auth credentials embedded in the remote URL are supported for backward-compatibility but SSH is preferred.
-- Rolling updates: images are pulled before containers are stopped. If the pull fails, containers remain running on the previous image and the deployment is retried on the next poll.
+- Rolling updates: images are pulled before `docker compose up`. If the pull fails, containers remain running on the previous image and the deployment is retried on the next poll.
 - Errors during removal of a stack (e.g. the compose file was deleted) may leave containers running if `docker compose down` fails.
 
 ---

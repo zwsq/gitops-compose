@@ -183,17 +183,11 @@ func (d *Deployment) Apply() (bool, error) {
 				d.Error = err
 				return false, err
 			}
-			_, err := d.ensureIsStopped()
-			if err != nil {
+			if err := d.compose.Start(); err != nil {
 				d.Error = err
 				return false, err
 			}
-			wasStarted, err := d.ensureIsRunning()
-			if err != nil {
-				d.Error = err
-				return false, err
-			}
-			return wasStarted, nil
+			return true, nil
 		}
 	case Unchanged:
 		{

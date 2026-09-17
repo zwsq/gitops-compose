@@ -257,10 +257,7 @@ func (r *DeploymentRepo) HasChanges() (bool, error) {
 			Force:      false,
 			Prune:      false,
 		}
-		if err := repo.Fetch(fetchOpts); err != nil {
-			if err == gogit.NoErrAlreadyUpToDate {
-				return false, nil
-			}
+		if err := repo.Fetch(fetchOpts); err != nil && err != gogit.NoErrAlreadyUpToDate {
 			return false, fmt.Errorf("fetch failed: %w", err)
 		}
 	}
@@ -278,16 +275,17 @@ func (r *DeploymentRepo) HasChanges() (bool, error) {
 	return localRef.Hash() != remoteRef.Hash(), nil
 }
 
-// ChangedDeploymentDirs returns the set of top-level deployment directories
-// (relative to the repository root) that contain at least one file changed
-// between the current local HEAD and the remote HEAD.
+// ChangedDeploymentDirs returns the set of deployment directories (relative
+// to the repository root) that contain at least one file changed between the
+// current local HEAD and the remote HEAD.
 //
-// A "deployment directory" is the immediate parent of any changed file, but
-// only up to the depth configured by the caller — here we return the
-// top-two-level path segment (e.g. "beta/payments") so that a change to
-// "beta/payments/.env" maps to "beta/payments", not "beta".
+// A deployment directory is the nearest ancestor of a changed file that
+// contains a compose.yaml or docker-compose.yml in either commit. A change to
+// "beta/payments/config/app.conf" therefore maps to "beta/payments" when that
+// directory holds the compose file — not to "beta/payments/config".
 //
-// If the two commits are identical, the returned slice is empty.
+// If the two commits are identical, or no in-scope compose deployments
+// changed, the returned slice is empty.
 func (r *DeploymentRepo) ChangedDeploymentDirs() ([]string, error) {
 	repo, err := gogit.PlainOpen(r.path)
 	if err != nil {
@@ -318,6 +316,17 @@ func (r *DeploymentRepo) ChangedDeploymentDirs() ([]string, error) {
 		return nil, fmt.Errorf("get remote commit failed: %w", err)
 	}
 
+	composeDirs := map[string]struct{}{}
+	for _, c := range []*object.Commit{localCommit, remoteCommit} {
+		dirs, err := r.composeDirsFromCommit(*c)
+		if err != nil {
+			return nil, err
+		}
+		for dir := range dirs {
+			composeDirs[dir] = struct{}{}
+		}
+	}
+
 	patch, err := localCommit.Patch(remoteCommit)
 	if err != nil {
 		return nil, fmt.Errorf("compute patch failed: %w", err)
@@ -336,8 +345,8 @@ func (r *DeploymentRepo) ChangedDeploymentDirs() ([]string, error) {
 					continue
 				}
 			}
-			dir := deploymentDirFromPath(f.Name)
-			if dir != "" {
+			dir, ok := nearestComposeDir(f.Name, composeDirs)
+			if ok {
 				seen[dir] = struct{}{}
 			}
 		}
@@ -362,16 +371,53 @@ func safeFile(f interface {
 	return object.File{Name: f.Path()}
 }
 
-// deploymentDirFromPath extracts the deployment directory from a file path.
-// For a path like "beta/payments/.env" it returns "beta/payments".
-// For a path like "payments/.env" it returns "payments".
-// Files at the repository root (no directory component) return "".
-func deploymentDirFromPath(filePath string) string {
-	dir := path.Dir(filePath)
-	if dir == "." || dir == "" {
-		return ""
+// composeDirsFromCommit returns the set of repository-relative directories that
+// contain a recognised compose file in the given commit.
+func (r *DeploymentRepo) composeDirsFromCommit(c object.Commit) (map[string]struct{}, error) {
+	files, err := r.filterComposeFiles(c)
+	if err != nil {
+		return nil, err
 	}
-	return dir
+	dirs := make(map[string]struct{}, len(files))
+	for _, fpath := range files {
+		rel, err := filepath.Rel(r.path, fpath)
+		if err != nil {
+			continue
+		}
+		rel = filepath.ToSlash(rel)
+		dir := path.Dir(rel)
+		if dir == "." {
+			dir = ""
+		}
+		dirs[dir] = struct{}{}
+	}
+	return dirs, nil
+}
+
+// nearestComposeDir walks from the changed file up to the nearest ancestor
+// directory that contains a compose file. ok is false when no compose ancestor
+// exists (the change is not part of a deployment).
+func nearestComposeDir(filePath string, composeDirs map[string]struct{}) (string, bool) {
+	dir := path.Dir(filepath.ToSlash(filePath))
+	if dir == "." {
+		dir = ""
+	}
+	for {
+		if _, ok := composeDirs[dir]; ok {
+			return dir, true
+		}
+		if dir == "" {
+			return "", false
+		}
+		parent := path.Dir(dir)
+		if parent == dir || parent == "." {
+			if _, ok := composeDirs[""]; ok {
+				return "", true
+			}
+			return "", false
+		}
+		dir = parent
+	}
 }
 
 // filterComposeFiles returns the full filesystem paths of all compose files in

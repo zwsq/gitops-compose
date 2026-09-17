@@ -205,13 +205,19 @@ func (c ComposeFile) IsRunning() (bool, error) {
 		return false, nil
 	}
 
+	running := map[string]bool{}
 	for _, container := range containers {
 		if container.State == "running" {
-			return true, nil
+			running[container.Service] = true
+		}
+	}
+	for _, name := range services {
+		if !running[name] {
+			return false, nil
 		}
 	}
 
-	return false, nil
+	return len(services) > 0, nil
 }
 
 func (c ComposeFile) Stop() error {

@@ -154,6 +154,30 @@ func TestHasChanges_WithNewCommit(t *testing.T) {
 	}
 }
 
+func TestHasChanges_StillDetectsAfterFetchWithoutPull(t *testing.T) {
+	bareDir, cloneDir, repo := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+	pushCommit(t, second, "beta/payments/.env", "IMG=v2", "main")
+
+	has, err := repo.HasChanges()
+	if err != nil {
+		t.Fatalf("HasChanges first call: %v (cloneDir=%s)", err, cloneDir)
+	}
+	if !has {
+		t.Fatal("expected changes after remote push")
+	}
+
+	// Fetch already ran; local HEAD is still behind. A second check must not
+	// treat AlreadyUpToDate as "no changes".
+	has, err = repo.HasChanges()
+	if err != nil {
+		t.Fatalf("HasChanges second call: %v", err)
+	}
+	if !has {
+		t.Error("expected changes to still be detected before pull")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ChangedDeploymentDirs
 // ---------------------------------------------------------------------------
@@ -161,6 +185,9 @@ func TestHasChanges_WithNewCommit(t *testing.T) {
 func TestChangedDeploymentDirs_EnvChange(t *testing.T) {
 	bareDir, cloneDir, repo := initBareAndClone(t, "main")
 	second := makeSecondClone(t, bareDir, "main")
+
+	pushCommit(t, second, "beta/payments/compose.yaml", "services: {}", "main")
+	mustRun(t, cloneDir, "git", "pull", "origin", "main")
 
 	pushCommit(t, second, "beta/payments/.env", "PAYMENTS_IMAGE=registry.example.com/payments:1.42.8", "main")
 
@@ -196,7 +223,9 @@ func TestChangedDeploymentDirs_NestedFile(t *testing.T) {
 	bareDir, cloneDir, repo := initBareAndClone(t, "main")
 	second := makeSecondClone(t, bareDir, "main")
 
-	// A nested config file change
+	pushCommit(t, second, "beta/payments/compose.yaml", "services: {}", "main")
+	mustRun(t, cloneDir, "git", "pull", "origin", "main")
+
 	pushCommit(t, second, "beta/payments/config/app.conf", "[app]\nport=8080", "main")
 	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
 
@@ -204,17 +233,11 @@ func TestChangedDeploymentDirs_NestedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// "beta/payments/config" — the immediate parent of the file
-	// Our deploymentDirFromPath returns path.Dir which is "beta/payments/config"
-	found := false
-	for _, d := range dirs {
-		if strings.HasPrefix(d, "beta/payments") {
-			found = true
-			break
-		}
+	if !containsDir(dirs, "beta/payments") {
+		t.Errorf("expected 'beta/payments' (compose ancestor), got %v", dirs)
 	}
-	if !found {
-		t.Errorf("expected a dir under beta/payments, got %v", dirs)
+	if containsDir(dirs, "beta/payments/config") {
+		t.Errorf("nested config dir should not be returned, got %v", dirs)
 	}
 }
 
@@ -222,7 +245,10 @@ func TestChangedDeploymentDirs_FrontendDoesNotAffectPayments(t *testing.T) {
 	bareDir, cloneDir, repo := initBareAndClone(t, "main")
 	second := makeSecondClone(t, bareDir, "main")
 
-	// Only beta/frontend changes
+	pushCommit(t, second, "beta/payments/compose.yaml", "services: {}", "main")
+	pushCommit(t, second, "beta/frontend/compose.yaml", "services: {}", "main")
+	mustRun(t, cloneDir, "git", "pull", "origin", "main")
+
 	pushCommit(t, second, "beta/frontend/.env", "FRONTEND_IMAGE=registry.example.com/frontend:2.0.0", "main")
 	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
 
@@ -278,6 +304,9 @@ func TestChangedDeploymentDirs_PrefixAllowsMatchingDir(t *testing.T) {
 	bareDir, cloneDir, _ := initBareAndClone(t, "main")
 	second := makeSecondClone(t, bareDir, "main")
 
+	pushCommit(t, second, "deployments/payments/compose.yaml", "services: {}", "main")
+	mustRun(t, cloneDir, "git", "pull", "origin", "main")
+
 	pushCommit(t, second, "deployments/payments/.env", "IMG=v2", "main")
 	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
 
@@ -299,22 +328,28 @@ func TestChangedDeploymentDirs_PrefixAllowsMatchingDir(t *testing.T) {
 // deploymentDirFromPath unit tests (pure function, no I/O)
 // ---------------------------------------------------------------------------
 
-func TestDeploymentDirFromPath(t *testing.T) {
+func TestNearestComposeDir(t *testing.T) {
+	composeDirs := map[string]struct{}{
+		"beta/payments": {},
+		"beta/frontend": {},
+	}
 	cases := []struct {
-		input    string
-		expected string
+		input  string
+		want   string
+		wantOK bool
 	}{
-		{"beta/payments/.env", "beta/payments"},
-		{"beta/payments/compose.yaml", "beta/payments"},
-		{"beta/payments/config/app.conf", "beta/payments/config"},
-		{"beta/frontend/.env", "beta/frontend"},
-		{"README.md", ""},
-		{"root-file.txt", ""},
+		{"beta/payments/.env", "beta/payments", true},
+		{"beta/payments/compose.yaml", "beta/payments", true},
+		{"beta/payments/config/app.conf", "beta/payments", true},
+		{"beta/frontend/.env", "beta/frontend", true},
+		{"README.md", "", false},
+		{"docs/guide.md", "", false},
 	}
 	for _, tc := range cases {
-		got := deploymentDirFromPath(tc.input)
-		if got != tc.expected {
-			t.Errorf("deploymentDirFromPath(%q) = %q, want %q", tc.input, got, tc.expected)
+		got, ok := nearestComposeDir(tc.input, composeDirs)
+		if ok != tc.wantOK || got != tc.want {
+			t.Errorf("nearestComposeDir(%q) = (%q, %v), want (%q, %v)",
+				tc.input, got, ok, tc.want, tc.wantOK)
 		}
 	}
 }
