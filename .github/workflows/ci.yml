@@ -37,4 +37,4 @@ jobs:
         run: go test ./... -count=1 -race
 
       - name: go build
-        run: go build -trimpath -o /dev/null ./cmd/main.go
+        run: go build -trimpath -o /dev/null ./cmd

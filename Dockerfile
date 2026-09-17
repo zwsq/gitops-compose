@@ -8,7 +8,7 @@ COPY . .
 
 RUN go mod download
 
-RUN go build -o /build ./cmd/main.go
+RUN go build -o /build ./cmd
 
 # Runtime
 

@@ -46,7 +46,7 @@ jobs:
             -trimpath \
             -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o "${BINARY_NAME}" \
-            ./cmd/main.go
+            ./cmd
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
