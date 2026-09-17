@@ -24,7 +24,6 @@ import (
 
 var (
 	ErrPathDoesNotExist = fmt.Errorf("path does not exist")
-	ErrHasLocalChanges  = fmt.Errorf("local changes detected")
 )
 
 // composeFileNames is Docker Compose's default discovery order.
@@ -239,6 +238,10 @@ func sanitiseOutput(out []byte) error {
 
 // HasChanges fetches the remote and reports whether the remote tracking branch
 // is ahead of the local branch.
+//
+// Local working-tree edits (and files left dirty by compose) must not stall
+// GitOps. Tracked modifications are discarded with `git reset --hard`;
+// untracked files are left in place and ignored.
 func (r *DeploymentRepo) HasChanges() (bool, error) {
 	repo, err := gogit.PlainOpen(r.path)
 	if err != nil {
@@ -255,8 +258,11 @@ func (r *DeploymentRepo) HasChanges() (bool, error) {
 		return false, fmt.Errorf("get status failed: %w", err)
 	}
 
-	if !status.IsClean() {
-		return false, ErrHasLocalChanges
+	if hasTrackedModifications(status) {
+		slog.Warn("discarding local working tree changes so GitOps can follow remote")
+		if err := r.runGit("reset", "--hard", "HEAD"); err != nil {
+			return false, fmt.Errorf("reset local changes failed: %w", err)
+		}
 	}
 
 	// Use git CLI fetch when SSH is configured so GIT_SSH_COMMAND is used.
@@ -547,6 +553,18 @@ func (r *DeploymentRepo) Pull() error {
 		}
 	}
 	return nil
+}
+
+func hasTrackedModifications(status gogit.Status) bool {
+	for _, st := range status {
+		if st.Worktree == gogit.Untracked && st.Staging == gogit.Untracked {
+			continue
+		}
+		if st.Worktree != gogit.Unmodified || st.Staging != gogit.Unmodified {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *DeploymentRepo) runGit(args ...string) error {

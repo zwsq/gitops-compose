@@ -35,7 +35,7 @@ gitops-compose
 5. `git pull` is run, then `docker compose up` is called for each affected deployment.
 6. If a deployment fails after the pull, it is retried on the next poll even if there are no new Git commits.
 
-> GitopsCompose exits early when the local repository is dirty. When reconciliation begins, errors are tracked per deployment but all deployments continue to be processed.
+> Local working-tree edits are discarded (`git reset --hard`) so the clone can follow remote. Untracked files are ignored. When reconciliation begins, errors are tracked per deployment but all deployments continue to be processed.
 
 ---
 

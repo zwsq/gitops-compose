@@ -178,6 +178,48 @@ func TestHasChanges_StillDetectsAfterFetchWithoutPull(t *testing.T) {
 	}
 }
 
+func TestHasChanges_DiscardsLocalTrackedEdits(t *testing.T) {
+	bareDir, cloneDir, repo := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+
+	writeFile(t, cloneDir, "README.md", "local edit that must not stall GitOps")
+	pushCommit(t, second, "from-remote.txt", "yes", "main")
+
+	has, err := repo.HasChanges()
+	if err != nil {
+		t.Fatalf("HasChanges with dirty tree: %v", err)
+	}
+	if !has {
+		t.Error("expected remote changes to be detected after discarding local edits")
+	}
+
+	data, err := os.ReadFile(filepath.Join(cloneDir, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) == "local edit that must not stall GitOps" {
+		t.Error("local tracked edit should have been discarded")
+	}
+}
+
+func TestHasChanges_IgnoresUntrackedFiles(t *testing.T) {
+	_, cloneDir, repo := initBareAndClone(t, "main")
+	if err := os.WriteFile(filepath.Join(cloneDir, "scratch.log"), []byte("tmp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	has, err := repo.HasChanges()
+	if err != nil {
+		t.Fatalf("untracked files should not fail HasChanges: %v", err)
+	}
+	if has {
+		t.Error("expected no remote changes")
+	}
+	if _, err := os.Stat(filepath.Join(cloneDir, "scratch.log")); err != nil {
+		t.Error("untracked file should be left in place")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ChangedDeploymentDirs
 // ---------------------------------------------------------------------------
