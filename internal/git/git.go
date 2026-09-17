@@ -9,6 +9,7 @@ package git
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path"
@@ -530,21 +531,39 @@ func (r *DeploymentRepo) GetLocalComposeFiles() ([]string, error) {
 	return r.filterComposeFiles(*commit)
 }
 
-// Pull fast-forwards the local branch to the remote HEAD.
-// TODO: Replace exec with go-git once https://github.com/go-git/go-git/pull/1235 is resolved.
+// Pull fast-forwards the local branch to origin/<branch>.
+// `git pull` without an explicit strategy fails on Git 2.27+ ("need to specify
+// how to reconcile divergent branches"). GitOps never merges: try --ff-only,
+// and if local has diverged, reset hard to the remote (remote is source of truth).
 func (r *DeploymentRepo) Pull() error {
-	cmd := exec.Command("git", "pull", "origin", r.branch)
+	if err := r.runGit("pull", "--ff-only", "origin", r.branch); err != nil {
+		slog.Warn("fast-forward pull failed, resetting to remote",
+			"branch", r.branch, "err", err)
+		if err := r.runGit("fetch", "origin", r.branch); err != nil {
+			return fmt.Errorf("fetch failed: %w", err)
+		}
+		if err := r.runGit("reset", "--hard", "origin/"+r.branch); err != nil {
+			return fmt.Errorf("reset to origin/%s failed: %w", r.branch, err)
+		}
+	}
+	return nil
+}
+
+func (r *DeploymentRepo) runGit(args ...string) error {
+	cmd := exec.Command("git", args...)
 	cmd.Dir = r.path
 	r.cmdWithSSH(cmd)
 
 	output, err := cmd.CombinedOutput()
-	if err != nil {
-		outStr := strings.TrimSpace(string(output))
-		if outStr == "Already up to date." || outStr == "Already up-to-date." {
-			return nil
-		}
-		return fmt.Errorf("pull failed: %w %s", err, outStr)
+	if err == nil {
+		return nil
 	}
-
-	return nil
+	outStr := strings.TrimSpace(string(output))
+	if outStr == "Already up to date." || outStr == "Already up-to-date." {
+		return nil
+	}
+	if outStr == "" {
+		return fmt.Errorf("%w", err)
+	}
+	return fmt.Errorf("%w %s", err, outStr)
 }

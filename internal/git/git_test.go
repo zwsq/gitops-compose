@@ -616,6 +616,28 @@ func TestPull_BranchAware(t *testing.T) {
 	}
 }
 
+func TestPull_DivergedLocalResetsToRemote(t *testing.T) {
+	bareDir, cloneDir, repo := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+
+	writeFile(t, cloneDir, "local-only.txt", "agent commit")
+	mustRun(t, cloneDir, "git", "add", "local-only.txt")
+	mustRun(t, cloneDir, "git", "commit", "-m", "local divergence")
+
+	pushCommit(t, second, "from-remote.txt", "remote wins", "main")
+
+	if err := repo.Pull(); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(cloneDir, "from-remote.txt")); err != nil {
+		t.Error("expected from-remote.txt after reset to origin")
+	}
+	if _, err := os.Stat(filepath.Join(cloneDir, "local-only.txt")); err == nil {
+		t.Error("local-only.txt should be discarded when resetting to remote")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

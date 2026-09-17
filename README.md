@@ -276,7 +276,7 @@ SSH host key verification is always enabled. `StrictHostKeyChecking=no` is inten
 - GitopsCompose polls Git on a fixed interval (`CHECK_INTERVAL_IN_SECONDS`).
 - On each poll, only the deployments whose files changed since the last successful sync are reconciled.
 - When `DEPLOYMENTS_PATH` is set, only that subtree is watched. Commits that only touch other directories still fast-forward the clone, but they do not reconcile any stack.
-- Git is pulled before compose is applied so the working tree matches remote. If apply fails, that deployment is retried on the next poll even if there are no new Git commits.
+- Git is pulled with `--ff-only` before compose is applied. If local and remote have diverged, the clone is reset to `origin/<branch>` (the remote is the source of truth). If apply fails, that deployment is retried on the next poll even if there are no new Git commits.
 - Image pull failures are retried on each subsequent poll until the pull succeeds or a new Git change is applied.
 - The `/webhook` endpoint (`POST /webhook`) triggers an immediate check without waiting for the next interval.
 
