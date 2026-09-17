@@ -26,6 +26,24 @@ var (
 	ErrHasLocalChanges  = fmt.Errorf("local changes detected")
 )
 
+// composeFileNames is Docker Compose's default discovery order.
+// https://docs.docker.com/compose/how-tos/file/
+var composeFileNames = []string{
+	"compose.yaml",
+	"compose.yml",
+	"docker-compose.yml",
+	"docker-compose.yaml",
+}
+
+func composeFileRank(base string) (int, bool) {
+	for i, name := range composeFileNames {
+		if name == base {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // DeploymentRepo represents a local clone of the GitOps deployment repository.
 type DeploymentRepo struct {
 	// HTTP basic-auth (nil when SSH is used)
@@ -280,7 +298,7 @@ func (r *DeploymentRepo) HasChanges() (bool, error) {
 // current local HEAD and the remote HEAD.
 //
 // A deployment directory is the nearest ancestor of a changed file that
-// contains a compose.yaml or docker-compose.yml in either commit. A change to
+// contains a recognised compose file in either commit. A change to
 // "beta/payments/config/app.conf" therefore maps to "beta/payments" when that
 // directory holds the compose file — not to "beta/payments/config".
 //
@@ -421,9 +439,9 @@ func nearestComposeDir(filePath string, composeDirs map[string]struct{}) (string
 }
 
 // filterComposeFiles returns the full filesystem paths of all compose files in
-// the commit tree rooted at the given commit.  Both "compose.yaml" and
-// "docker-compose.yml" are recognised; when both exist in the same directory,
-// only "compose.yaml" is returned (preferred).
+// the commit tree rooted at the given commit. Recognised names are compose.yaml,
+// compose.yml, docker-compose.yml, and docker-compose.yaml. When several exist
+// in the same directory, the Docker Compose preference order is used.
 func (r *DeploymentRepo) filterComposeFiles(c object.Commit) ([]string, error) {
 	tree, err := c.Tree()
 	if err != nil {
@@ -447,16 +465,18 @@ func (r *DeploymentRepo) filterComposeFiles(c object.Commit) ([]string, error) {
 			dir = ""
 		}
 
-		switch base {
-		case "compose.yaml":
-			// Always prefer compose.yaml
-			dirToFile[dir] = filepath.Join(r.path, f.Name)
-		case "docker-compose.yml":
-			// Only use docker-compose.yml if compose.yaml not already found
-			if _, exists := dirToFile[dir]; !exists {
-				dirToFile[dir] = filepath.Join(r.path, f.Name)
+		rank, ok := composeFileRank(base)
+		if !ok {
+			return nil
+		}
+		full := filepath.Join(r.path, f.Name)
+		if existing, exists := dirToFile[dir]; exists {
+			existingRank, _ := composeFileRank(path.Base(existing))
+			if rank >= existingRank {
+				return nil
 			}
 		}
+		dirToFile[dir] = full
 		return nil
 	})
 	if err != nil {

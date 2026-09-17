@@ -50,12 +50,29 @@ func TestFindComposeFile_OnlyComposeYaml(t *testing.T) {
 	}
 }
 
-func TestFindComposeFile_NeitherExists(t *testing.T) {
+func TestFindComposeFile_DockerComposeYaml(t *testing.T) {
 	dir := t.TempDir()
+	writeFile(t, dir, "docker-compose.yaml", "services: {}")
 
-	_, err := FindComposeFile(dir)
-	if err == nil {
-		t.Error("expected error when no compose file exists")
+	got, err := FindComposeFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(got) != "docker-compose.yaml" {
+		t.Errorf("expected docker-compose.yaml, got %s", got)
+	}
+}
+
+func TestFindComposeFile_ComposeYml(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "compose.yml", "services: {}")
+
+	got, err := FindComposeFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(got) != "compose.yml" {
+		t.Errorf("expected compose.yml, got %s", got)
 	}
 }
 

@@ -336,7 +336,7 @@ func (g *GitOps) CheckAndUpdate() {
 				g.metrics.TrackCheckStatus("error")
 				return
 			}
-			slog.Info("git changes outside watched deployments path, skipping apply")
+			slog.Info("git changes did not map to any compose deployment, skipping apply")
 			return
 		}
 

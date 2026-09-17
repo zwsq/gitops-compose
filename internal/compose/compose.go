@@ -33,19 +33,22 @@ func NewComposeFile(filepath string) *ComposeFile {
 	}
 }
 
-// FindComposeFile returns the preferred Compose file path inside dir.
-// "compose.yaml" takes precedence over "docker-compose.yml".
-// Returns an error when neither file exists.
+// FindComposeFile returns the preferred Compose file path inside dir, using
+// Docker Compose's default name order. Returns an error when none exist.
 func FindComposeFile(dir string) (string, error) {
-	preferred := filepath.Join(dir, "compose.yaml")
-	if _, err := os.Stat(preferred); err == nil {
-		return preferred, nil
+	names := []string{
+		"compose.yaml",
+		"compose.yml",
+		"docker-compose.yml",
+		"docker-compose.yaml",
 	}
-	fallback := filepath.Join(dir, "docker-compose.yml")
-	if _, err := os.Stat(fallback); err == nil {
-		return fallback, nil
+	for _, name := range names {
+		candidate := filepath.Join(dir, name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
 	}
-	return "", fmt.Errorf("no compose file found in %s (tried compose.yaml and docker-compose.yml)", dir)
+	return "", fmt.Errorf("no compose file found in %s (tried %s)", dir, strings.Join(names, ", "))
 }
 
 func (c ComposeFile) LoadProject() (*types.Project, error) {

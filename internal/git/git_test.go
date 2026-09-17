@@ -324,6 +324,87 @@ func TestChangedDeploymentDirs_PrefixAllowsMatchingDir(t *testing.T) {
 	}
 }
 
+func TestChangedDeploymentDirs_DockerComposeYamlNestedEnv(t *testing.T) {
+	bareDir, cloneDir, _ := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+
+	relDir := "docker/staging/services/imex/gateway/router-private-host"
+	pushCommit(t, second, relDir+"/docker-compose.yaml", "services:\n  nginx:\n    image: nginx\n", "main")
+	mustRun(t, cloneDir, "git", "pull", "origin", "main")
+
+	pushCommit(t, second, relDir+"/.env", "IMAGE=repo.example.com/nginx:1.20\n", "main")
+	mustRun(t, cloneDir, "git", "fetch", "origin", "main")
+
+	repo, err := NewDeploymentRepo(cloneDir, WithBranch("main"), WithDeploymentsPath("docker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dirs, err := repo.ChangedDeploymentDirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsDir(dirs, relDir) {
+		t.Errorf("expected %q in changed dirs, got %v", relDir, dirs)
+	}
+}
+
+func TestFilterComposeFiles_DockerComposeYaml(t *testing.T) {
+	bareDir, cloneDir, repo := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+
+	pushCommit(t, second, "beta/gateway/docker-compose.yaml", "services: {}", "main")
+	mustRun(t, cloneDir, "git", "pull", "origin", "main")
+
+	goRepo, _ := gogit.PlainOpen(cloneDir)
+	ref, _ := goRepo.Reference(repo.localRef(), true)
+	commit, _ := goRepo.CommitObject(ref.Hash())
+
+	files, err := repo.filterComposeFiles(*commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, f := range files {
+		if filepath.Base(f) == "docker-compose.yaml" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected docker-compose.yaml in result, got: %v", files)
+	}
+}
+
+func TestFilterComposeFiles_ComposeYml(t *testing.T) {
+	bareDir, cloneDir, repo := initBareAndClone(t, "main")
+	second := makeSecondClone(t, bareDir, "main")
+
+	pushCommit(t, second, "beta/gateway/compose.yml", "services: {}", "main")
+	mustRun(t, cloneDir, "git", "pull", "origin", "main")
+
+	goRepo, _ := gogit.PlainOpen(cloneDir)
+	ref, _ := goRepo.Reference(repo.localRef(), true)
+	commit, _ := goRepo.CommitObject(ref.Hash())
+
+	files, err := repo.filterComposeFiles(*commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, f := range files {
+		if filepath.Base(f) == "compose.yml" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected compose.yml in result, got: %v", files)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // deploymentDirFromPath unit tests (pure function, no I/O)
 // ---------------------------------------------------------------------------

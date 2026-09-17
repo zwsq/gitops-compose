@@ -30,7 +30,7 @@ gitops-compose
 
 1. On start and on every poll interval, `git fetch` is run against the configured remote.
 2. If the remote branch is ahead of local HEAD, the set of changed file paths is computed.
-3. Each changed path is mapped to the nearest ancestor directory that contains a `compose.yaml` or `docker-compose.yml` file.
+3. Each changed path is mapped to the nearest ancestor directory that contains a recognised compose file (`compose.yaml`, `compose.yml`, `docker-compose.yml`, or `docker-compose.yaml`).
 4. Only the affected deployments are reconciled — a change to `beta/payments/.env` will not cause `beta/frontend` to be restarted. Nested files such as `beta/payments/config/app.conf` still map to `beta/payments`.
 5. `git pull` is run, then `docker compose up` is called for each affected deployment.
 6. If a deployment fails after the pull, it is retried on the next poll even if there are no new Git commits.
@@ -41,7 +41,7 @@ gitops-compose
 
 ## Repository layout
 
-The Git repository contains one or more independent Compose deployments organised in subdirectories. Any directory structure is supported; a "deployment" is simply a directory that contains a `compose.yaml` or `docker-compose.yml` file.
+The Git repository contains one or more independent Compose deployments organised in subdirectories. Any directory structure is supported; a "deployment" is simply a directory that contains a recognised compose file.
 
 ```text
 deployments/
@@ -79,7 +79,7 @@ Docker Compose then determines which containers need to be recreated.
 
 ### Compose file names
 
-Both `compose.yaml` and `docker-compose.yml` are supported. When both exist in the same directory, `compose.yaml` is preferred.
+Both `compose.yaml` / `compose.yml` and `docker-compose.yml` / `docker-compose.yaml` are supported. When more than one exists in the same directory, Docker Compose's default order is used (`compose.yaml` first).
 
 ---
 
